@@ -67,10 +67,12 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
             for (network in cm.allNetworks) {
                 val caps = cm.getNetworkCapabilities(network) ?: continue
                 if (caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)) {
-                    cm.bindProcessToNetwork(network)
-                    cameraClient.bindToNetwork(network)
-                    Log.i(TAG, "Tier 1: Bound to existing WiFi network")
-                    return true
+                    val bound = cm.bindProcessToNetwork(network)
+                    Log.i(TAG, "Tier 1: bindProcessToNetwork returned: $bound")
+                    if (bound) {
+                        cameraClient.bindToNetwork(network)
+                        return true
+                    }
                 }
             }
         } catch (e: Exception) {
@@ -88,11 +90,11 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
 
             val callback = object : ConnectivityManager.NetworkCallback() {
                 override fun onAvailable(network: Network) {
-                    cm.bindProcessToNetwork(network)
+                    val bound = cm.bindProcessToNetwork(network)
+                    Log.i(TAG, "Tier 2: bindProcessToNetwork returned: $bound")
                     cameraClient.bindToNetwork(network)
                     networkCallback = this
-                    Log.i(TAG, "Tier 2: WiFi callback fired, bound")
-                    if (cont.isActive) cont.resumeWith(Result.success(true))
+                    if (bound && cont.isActive) cont.resumeWith(Result.success(true))
                 }
 
                 override fun onLost(network: Network) {

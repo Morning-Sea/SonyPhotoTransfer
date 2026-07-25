@@ -52,7 +52,7 @@ data class BrowseResult(
  */
 class SonyCameraClient {
 
-    private var client: OkHttpClient = buildClient(null)
+    private var client: OkHttpClient = buildClient()
     private var baseUrl: String = "http://192.168.122.1:64321"
 
     private val contentDirectoryUrl get() = "$baseUrl/upnp/control/ContentDirectory"
@@ -62,12 +62,22 @@ class SonyCameraClient {
     private val nsContentDirectory = "urn:schemas-upnp-org:service:ContentDirectory:1"
     private val nsXPushList = "urn:schemas-sony-com:service:XPushList:1"
 
-    fun bindToNetwork(network: Network) { client = buildClient(network) }
+    fun bindToNetwork(network: Network) {
+        // NOTE: We intentionally do NOT use network.socketFactory here.
+        // On many Chinese ROMs (ColorOS/HyperOS/MIUI), network.socketFactory
+        // throws "SocketException: EPERM (Operation not permitted)" when
+        // binding sockets to a no-internet WiFi network.
+        //
+        // Instead, we rely on ConnectivityManager.bindProcessToNetwork()
+        // (called from the ViewModel) which routes ALL process traffic through
+        // the WiFi network at the system level, including default OkHttp sockets.
+        client = buildClient()
+    }
+
     fun getHttpClient(): OkHttpClient = client
 
-    private fun buildClient(network: Network?): OkHttpClient {
+    private fun buildClient(): OkHttpClient {
         return OkHttpClient.Builder().apply {
-            if (network != null) socketFactory(network.socketFactory)
             connectTimeout(10, TimeUnit.SECONDS)
             readTimeout(120, TimeUnit.SECONDS)
             writeTimeout(60, TimeUnit.SECONDS)
