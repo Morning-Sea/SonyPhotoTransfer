@@ -6,9 +6,9 @@ import android.net.ConnectivityManager
 import android.net.Network
 import android.net.NetworkCapabilities
 import android.net.NetworkRequest
+import android.util.Log
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
-import kotlinx.coroutines.CancellableContinuation
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -18,6 +18,8 @@ import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.suspendCancellableCoroutine
+
+private const val TAG = "CameraVM"
 
 enum class ConnectionState {
     DISCONNECTED, DISCOVERING, CONNECTING, READY, ERROR
@@ -50,6 +52,92 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
     private var downloadJob: Job? = null
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
 
+    // ── WiFi Network Binding (3-tier fallback) ───────────────────────
+    //
+    // Problem: On camera WiFi AP (no internet), Android prefers mobile data.
+    // We must force HTTP traffic through WiFi. But `requestNetwork()` often
+    // fails on Chinese ROMs (ColorOS, HyperOS, MIUI) for no-internet WiFi.
+    //
+    // Strategy:
+    //   Tier 1: Find existing WiFi via getAllNetworks() → bind directly
+    //   Tier 2: registerNetworkCallback() → wait for WiFi
+    //   Tier 3: Skip binding entirely → try raw connection (works on some devices)
+
+    private fun getConnectivityManager(): ConnectivityManager {
+        return getApplication<Application>()
+            .getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+    }
+
+    /**
+     * Tier 1: Scan all active networks for a WiFi one and bind to it.
+     */
+    private fun tryBindExistingWifi(): Boolean {
+        val cm = getConnectivityManager()
+        try {
+            for (network in cm.allNetworks) {
+                val caps = cm.getNetworkCapabilities(network) ?: continue
+                if (caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)) {
+                    cm.bindProcessToNetwork(network)
+                    cameraClient.bindToNetwork(network)
+                    Log.i(TAG, "Tier 1: Bound to existing WiFi network")
+                    return true
+                }
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Tier 1 failed: ${e.message}")
+        }
+        return false
+    }
+
+    /**
+     * Tier 2: Register a network callback and wait for WiFi.
+     */
+    private suspend fun tryRegisterCallback(): Boolean {
+        val cm = getConnectivityManager()
+        return suspendCancellableCoroutine { cont ->
+            val request = NetworkRequest.Builder()
+                .addTransportType(NetworkCapabilities.TRANSPORT_WIFI)
+                .build()
+
+            val callback = object : ConnectivityManager.NetworkCallback() {
+                override fun onAvailable(network: Network) {
+                    cm.bindProcessToNetwork(network)
+                    cameraClient.bindToNetwork(network)
+                    networkCallback = this
+                    Log.i(TAG, "Tier 2: WiFi callback fired, bound")
+                    if (cont.isActive) cont.resumeWith(Result.success(true))
+                }
+
+                override fun onLost(network: Network) {
+                    cm.bindProcessToNetwork(null)
+                    _uiState.update {
+                        it.copy(
+                            connectionState = ConnectionState.DISCONNECTED,
+                            statusMessage = "WiFi disconnected"
+                        )
+                    }
+                }
+            }
+            try {
+                cm.registerNetworkCallback(request, callback)
+            } catch (e: Exception) {
+                Log.w(TAG, "Tier 2 registerNetworkCallback failed: ${e.message}")
+                if (cont.isActive) cont.resumeWith(Result.success(false))
+                return@suspendCancellableCoroutine
+            }
+
+            // Timeout after 5s
+            viewModelScope.launch {
+                delay(5000)
+                if (cont.isActive) {
+                    Log.w(TAG, "Tier 2 timed out")
+                    try { cm.unregisterNetworkCallback(callback) } catch (_: Exception) {}
+                    cont.resumeWith(Result.success(false))
+                }
+            }
+        }
+    }
+
     // ── Connection Flow ──────────────────────────────────────────────
 
     fun connect() {
@@ -57,71 +145,36 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
             _uiState.update {
                 it.copy(
                     connectionState = ConnectionState.DISCOVERING,
-                    statusMessage = "Binding to WiFi network…",
+                    statusMessage = "Binding to WiFi…",
                     errorMessage = null,
                     contents = emptyList(),
                     selectedIndices = emptySet()
                 )
             }
 
-            // Step 1: Bind process to WiFi (critical for camera AP without internet)
-            val cm = getApplication<Application>()
-                .getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+            // === WiFi Binding (3 tiers) ===
+            var wifiBound = tryBindExistingWifi()
 
-            val bound = suspendCancellableCoroutine { cont: CancellableContinuation<Boolean> ->
-                val request = NetworkRequest.Builder()
-                    .addTransportType(NetworkCapabilities.TRANSPORT_WIFI)
-                    .build()
-
-                val callback = object : ConnectivityManager.NetworkCallback() {
-                    override fun onAvailable(network: Network) {
-                        cm.bindProcessToNetwork(network)
-                        cameraClient.bindToNetwork(network)
-                        networkCallback = this
-                        if (cont.isActive) cont.resumeWith(Result.success(true))
-                    }
-
-                    override fun onLost(network: Network) {
-                        cm.bindProcessToNetwork(null)
-                        _uiState.update {
-                            it.copy(
-                                connectionState = ConnectionState.DISCONNECTED,
-                                statusMessage = "WiFi disconnected"
-                            )
-                        }
-                    }
-                }
-                try {
-                    cm.requestNetwork(request, callback)
-                } catch (_: Exception) {
-                    if (cont.isActive) cont.resumeWith(Result.success(false))
-                }
-                // Timeout after 8s
-                viewModelScope.launch {
-                    delay(8000)
-                    if (cont.isActive) cont.resumeWith(Result.success(false))
-                }
+            if (!wifiBound) {
+                _uiState.update { it.copy(statusMessage = "Waiting for WiFi callback…") }
+                wifiBound = tryRegisterCallback()
             }
 
-            if (!bound) {
-                _uiState.update {
-                    it.copy(
-                        connectionState = ConnectionState.ERROR,
-                        errorMessage = "Cannot bind to WiFi.\nMake sure you're connected to the camera's WiFi network.",
-                        statusMessage = "WiFi binding failed"
-                    )
-                }
-                return@launch
+            if (!wifiBound) {
+                // Tier 3: Skip binding, proceed without it
+                Log.w(TAG, "Tier 3: Skipping WiFi binding, trying raw connection")
+                _uiState.update { it.copy(statusMessage = "Skipped WiFi binding, trying direct…") }
+                // Don't return — let SSDP/fallback try anyway
             }
 
-            // Step 2: SSDP Discovery
+            // === SSDP Discovery ===
             _uiState.update { it.copy(statusMessage = "Searching for camera…") }
             val ctx = getApplication<Application>()
-            val locationUrl = cameraClient.discover(ctx)
+            var locationUrl = cameraClient.discover(ctx)
 
             if (locationUrl == null) {
-                // Fallback: try common IPs
-                _uiState.update { it.copy(statusMessage = "SSDP timeout, trying common addresses…") }
+                // Fallback: try common camera IPs
+                _uiState.update { it.copy(statusMessage = "SSDP timeout, trying common IPs…") }
                 val fallbackUrl = cameraClient.tryFallbackAddresses()
                 if (fallbackUrl != null) {
                     cameraClient.initFromBaseUrl(fallbackUrl)
@@ -129,17 +182,25 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
                         it.copy(
                             connectionState = ConnectionState.CONNECTING,
                             modelName = "Sony Camera",
-                            statusMessage = "Found camera via fallback, connecting…"
+                            statusMessage = "Found camera, connecting…"
                         )
                     }
                 } else {
                     _uiState.update {
                         it.copy(
                             connectionState = ConnectionState.ERROR,
-                            errorMessage = "Camera not found.\n\n" +
-                                    "1. On camera: Menu → Network → Send to Smartphone\n" +
-                                    "2. Connect phone to camera's WiFi\n" +
-                                    "3. Tap Retry",
+                            errorMessage = buildString {
+                                append("Camera not found.\n\n")
+                                if (!wifiBound) {
+                                    append("⚠ WiFi binding also failed.\n")
+                                    append("Try turning OFF mobile data, then retry.\n\n")
+                                }
+                                append("Steps:\n")
+                                append("1. Camera: Menu → Network → Send to Smartphone\n")
+                                append("2. Phone: Connect to camera WiFi\n")
+                                append("3. (Optional) Turn off mobile data\n")
+                                append("4. Tap Retry")
+                            },
                             statusMessage = "Camera not found"
                         )
                     }
@@ -150,7 +211,7 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
                 _uiState.update {
                     it.copy(
                         connectionState = ConnectionState.CONNECTING,
-                        statusMessage = "Found camera, reading device info…"
+                        statusMessage = "Found camera, reading info…"
                     )
                 }
                 val initResult = cameraClient.initFromDescription(locationUrl)
@@ -167,7 +228,7 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
                 _uiState.update { it.copy(modelName = initResult.getOrDefault("Sony Camera")) }
             }
 
-            // Step 3: Switch to Contents Transfer mode
+            // === Switch to Contents Transfer mode ===
             _uiState.update { it.copy(statusMessage = "Switching to transfer mode…") }
             cameraClient.switchToTransferMode()
 
@@ -175,14 +236,15 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
                 _uiState.update {
                     it.copy(
                         connectionState = ConnectionState.ERROR,
-                        errorMessage = "This camera does not support content transfer via WiFi API (avContent service missing).",
+                        errorMessage = "Content transfer not supported (avContent service missing).\n\n" +
+                                "Make sure the camera is in 'Send to Smartphone' mode, not 'Remote Ctrl'.",
                         statusMessage = "Not supported"
                     )
                 }
                 return@launch
             }
 
-            // Step 4: Get content count & first page
+            // === Load photos ===
             _uiState.update { it.copy(statusMessage = "Loading photos…") }
             val totalCount = cameraClient.getContentCount().getOrDefault(0)
             val listResult = cameraClient.getContentList(startIndex = 0, count = 100)
@@ -294,7 +356,6 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
 
                 if (result.isSuccess) {
                     val data = result.getOrThrow()
-                    // Determine filename with extension
                     val filename = if ('.' in item.title) item.title
                     else "${item.title}.JPG"
 
@@ -327,8 +388,7 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
     // ── Disconnect ───────────────────────────────────────────────────
 
     fun disconnect() {
-        val cm = getApplication<Application>()
-            .getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+        val cm = getConnectivityManager()
         cm.bindProcessToNetwork(null)
         networkCallback?.let {
             try {
