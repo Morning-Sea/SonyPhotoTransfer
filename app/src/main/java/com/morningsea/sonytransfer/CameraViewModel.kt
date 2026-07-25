@@ -172,19 +172,26 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
 
             // === Check camera reachability ===
             val reachable = cameraClient.checkReachable()
-            if (!reachable) {
+            if (reachable.isFailure) {
+                val errorDetail = reachable.exceptionOrNull()?.let {
+                    "${it.javaClass.simpleName}: ${it.message ?: "no message"}"
+                } ?: "Unknown error"
                 _uiState.update {
                     it.copy(
                         connectionState = ConnectionState.ERROR,
                         errorMessage = buildString {
-                            append("Camera not reachable at ${if (gatewayIp != null) "$gatewayIp:64321" else "192.168.122.1:64321"}.\n\n")
+                            append("Camera not reachable at ${cameraClient.getBaseUrl()}\n\n")
+                            append("Error: $errorDetail\n\n")
                             if (!wifiBound) {
-                                append("⚠ WiFi binding failed.\n")
-                                append("→ Turn OFF mobile data, then retry.\n\n")
+                                append("⚠ WiFi binding failed (Tier 1-3 all failed).\n")
+                                append("→ This is the most likely cause.\n")
+                                append("→ Try: Turn OFF mobile data, then retry.\n")
+                                append("→ Or: In phone WiFi settings, find camera WiFi,\n")
+                                append("   tap it → 'Yes' to stay connected.\n\n")
                             }
                             append("Steps:\n")
                             append("1. Camera: MENU → Network → Send to Smartphone\n")
-                            append("2. Select images (or 'This Image') to start WiFi AP\n")
+                            append("2. Select any photo to start WiFi AP\n")
                             append("3. Phone: Connect to camera's WiFi\n")
                             append("4. Turn off mobile data\n")
                             append("5. Tap Retry")

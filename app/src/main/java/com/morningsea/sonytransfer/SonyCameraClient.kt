@@ -98,15 +98,20 @@ class SonyCameraClient {
 
     // ── Reachability Check ───────────────────────────────────────────
 
-    suspend fun checkReachable(): Boolean = withContext(Dispatchers.IO) {
+    suspend fun checkReachable(): Result<String> = withContext(Dispatchers.IO) {
         try {
             val req = Request.Builder().url("$baseUrl/DmsDescPush.xml").build()
             val resp = client.newCall(req).execute()
-            val body = resp.body?.string() ?: return@withContext false
-            resp.isSuccessful && body.contains("SonyDigitalMediaServer")
+            val body = resp.body?.string()
+                ?: return@withContext Result.failure(Exception("Empty response body"))
+            if (resp.isSuccessful && body.contains("SonyDigitalMediaServer")) {
+                Result.success("OK")
+            } else {
+                Result.failure(Exception("HTTP ${resp.code}: response doesn't match SonyDigitalMediaServer"))
+            }
         } catch (e: Exception) {
-            Log.w(TAG, "Reachability check failed: ${e.message}")
-            false
+            Log.w(TAG, "Reachability check failed: ${e.javaClass.simpleName}: ${e.message}")
+            Result.failure(e)
         }
     }
 
