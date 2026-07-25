@@ -322,11 +322,13 @@ fun ConnectScreen(onConnect: () -> Unit) {
                     fontSize = 14.sp
                 )
                 Spacer(Modifier.height(10.dp))
-                StepText("1", "On camera: Menu → Network → Send to Smartphone")
+                StepText("1", "Camera: MENU → Network → Send to Smartphone")
                 Spacer(Modifier.height(6.dp))
-                StepText("2", "On phone: Connect to camera's WiFi (DIRECT-xxxx)")
+                StepText("2", "Select any photo to start the WiFi hotspot")
                 Spacer(Modifier.height(6.dp))
-                StepText("3", "Tap \"Connect to Camera\" above")
+                StepText("3", "Phone: Connect to camera's WiFi (DIRECT-xxxx)")
+                Spacer(Modifier.height(6.dp))
+                StepText("4", "Turn OFF mobile data, then tap Connect above")
             }
         }
     }

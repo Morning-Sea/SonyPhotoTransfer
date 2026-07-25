@@ -10,34 +10,57 @@ import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
-import org.json.JSONArray
-import org.json.JSONObject
+import org.w3c.dom.Element
+import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
-import java.net.DatagramPacket
-import java.net.DatagramSocket
-import java.net.InetAddress
-import java.net.SocketTimeoutException
 import java.util.concurrent.TimeUnit
+import javax.xml.parsers.DocumentBuilderFactory
 
 private const val TAG = "SonyCam"
 
+const val ROOT_DIR_PUSH = "PushRoot"   // images user selected on camera
+const val ROOT_DIR_PULL = "PhotoRoot"  // all images, browse from phone
+
 data class ContentItem(
-    val uri: String,
-    val contentKind: String,
+    val id: String,
     val title: String,
-    val createdTime: String,
     val thumbnailUrl: String?,
-    val largeThumbnailUrl: String?,
+    val largeUrl: String?,
     val originalUrl: String?,
     val fileSize: Long
 )
 
+data class BrowseResult(
+    val items: List<ContentItem>,
+    val containerIds: List<String>,
+    val numberReturned: Int,
+    val totalMatches: Int
+)
+
+/**
+ * Client for Sony camera's DLNA/UPnP SOAP protocol (port 64321).
+ *
+ * This is the protocol used in "Send to Smartphone" camera mode.
+ * The camera exposes itself as a UPnP MediaServer (DMS-1.50).
+ *
+ * Flow:
+ * 1. GET /DmsDescPush.xml → device description
+ * 2. SOAP X_TransferStart → begin transfer session
+ * 3. SOAP Browse on ContentDirectory → list photos (DIDL-Lite)
+ * 4. HTTP GET on res URLs → download photos
+ * 5. SOAP X_TransferEnd → end session
+ */
 class SonyCameraClient {
 
     private var client: OkHttpClient = buildClient(null)
-    private var cameraEndpoint: String? = null
-    private var avContentEndpoint: String? = null
-    private var requestId = 1
+    private var baseUrl: String = "http://192.168.122.1:64321"
+
+    private val contentDirectoryUrl get() = "$baseUrl/upnp/control/ContentDirectory"
+    private val xPushListUrl get() = "$baseUrl/upnp/control/XPushList"
+
+    private val nsSoap = "http://schemas.xmlsoap.org/soap/envelope/"
+    private val nsContentDirectory = "urn:schemas-upnp-org:service:ContentDirectory:1"
+    private val nsXPushList = "urn:schemas-sony-com:service:XPushList:1"
 
     fun bindToNetwork(network: Network) { client = buildClient(network) }
     fun getHttpClient(): OkHttpClient = client
@@ -51,8 +74,13 @@ class SonyCameraClient {
         }.build()
     }
 
+    fun setBaseUrl(ip: String, port: Int = 64321) {
+        baseUrl = "http://$ip:$port"
+    }
+
+    fun getBaseUrl(): String = baseUrl
+
     // ── Get Camera IP from WiFi DHCP ─────────────────────────────────
-    // When phone connects to camera's WiFi AP, the gateway = camera IP.
 
     fun getGatewayIp(context: Context): String? {
         try {
@@ -61,324 +89,265 @@ class SonyCameraClient {
             val dhcp = wm.dhcpInfo ?: return null
             val gw = dhcp.gateway
             if (gw == 0) return null
-            // Android stores IP as little-endian int
-            val ip = "${gw and 0xFF}.${(gw shr 8) and 0xFF}.${(gw shr 16) and 0xFF}.${(gw shr 24) and 0xFF}"
-            Log.i(TAG, "DHCP gateway (camera IP): $ip")
-            return ip
+            return "${gw and 0xFF}.${(gw shr 8) and 0xFF}.${(gw shr 16) and 0xFF}.${(gw shr 24) and 0xFF}"
         } catch (e: Exception) {
             Log.w(TAG, "Failed to get gateway IP: ${e.message}")
             return null
         }
     }
 
-    // ── SSDP Discovery ───────────────────────────────────────────────
+    // ── Reachability Check ───────────────────────────────────────────
 
-    suspend fun discover(context: Context, timeoutMs: Long = 6000): String? =
-        withContext(Dispatchers.IO) {
-            val wifiManager =
-                context.applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
-            val multicastLock = wifiManager.createMulticastLock("ssdp_discovery").apply {
-                setReferenceCounted(false)
-                acquire()
-            }
-            try {
-                val msg = ("M-SEARCH * HTTP/1.1\r\n" +
-                        "HOST: 239.255.255.250:1900\r\n" +
-                        "MAN: \"ssdp:discover\"\r\n" +
-                        "MX: 3\r\n" +
-                        "ST: urn:schemas-sony-com:service:ScalarWebAPI:1\r\n" +
-                        "\r\n").toByteArray()
-
-                val socket = DatagramSocket().apply {
-                    soTimeout = timeoutMs.toInt()
-                    broadcast = true
-                }
-                val dest = InetAddress.getByName("239.255.255.250")
-                repeat(3) {
-                    socket.send(DatagramPacket(msg, msg.size, dest, 1900))
-                    Thread.sleep(80)
-                }
-                val buf = ByteArray(4096)
-                val recv = DatagramPacket(buf, buf.size)
-                try {
-                    socket.receive(recv)
-                    val response = String(recv.data, 0, recv.length)
-                    Log.i(TAG, "SSDP response: $response")
-                    Regex("LOCATION:\\s*(.+?)\\r?\\n", RegexOption.IGNORE_CASE)
-                        .find(response)?.groupValues?.get(1)?.trim()
-                } catch (_: SocketTimeoutException) {
-                    Log.w(TAG, "SSDP timed out")
-                    null
-                } finally {
-                    socket.close()
-                }
-            } catch (e: Exception) {
-                Log.w(TAG, "SSDP error: ${e.message}")
-                null
-            } finally {
-                try { multicastLock.release() } catch (_: Exception) {}
-            }
-        }
-
-    // ── Smart Fallback: Gateway IP + Port Scan ───────────────────────
-
-    /**
-     * Try to find the camera using the WiFi gateway IP + common ports.
-     * This is more reliable than SSDP on many Chinese ROM devices.
-     *
-     * Returns: the device description URL if found, or null.
-     */
-    suspend fun tryGatewayDiscovery(context: Context): String? = withContext(Dispatchers.IO) {
-        val gatewayIp = getGatewayIp(context) ?: return@withContext null
-        Log.i(TAG, "Trying gateway IP: $gatewayIp")
-
-        // Sony cameras commonly use these ports
-        val ports = listOf(10000, 8080, 64321, 80)
-        // Common device description paths
-        val descPaths = listOf(
-            "/sony",                          // most common
-            "/sony/accessControl/DDService",  // some older models
-            ""                                // root
-        )
-
-        for (port in ports) {
-            // Strategy A: Try to fetch device description XML
-            for (path in descPaths) {
-                try {
-                    val url = "http://$gatewayIp:$port$path"
-                    Log.d(TAG, "Trying device description at: $url")
-                    val req = Request.Builder().url(url)
-                        .header("Connection", "close")
-                        .build()
-                    val resp = client.newCall(req).execute()
-                    val body = resp.body?.string() ?: continue
-                    // Check if response looks like Sony device description XML
-                    if (body.contains("ScalarWebAPI") || body.contains("sony")) {
-                        Log.i(TAG, "Found device description at $url")
-                        return@withContext url
-                    }
-                } catch (_: Exception) {
-                    continue
-                }
-            }
-
-            // Strategy B: Try direct JSON-RPC API call
-            try {
-                val apiBase = "http://$gatewayIp:$port/sony/"
-                val testReq = Request.Builder()
-                    .url("${apiBase}camera")
-                    .post(
-                        """{"method":"getAvailableApiList","params":[],"id":1,"version":"1.0"}"""
-                            .toRequestBody("application/json".toMediaType())
-                    ).build()
-                val resp = client.newCall(testReq).execute()
-                if (resp.isSuccessful) {
-                    val body = resp.body?.string() ?: continue
-                    if (body.contains("\"result\"")) {
-                        Log.i(TAG, "Found API at $apiBase via direct call")
-                        // Initialize directly since we confirmed the API works
-                        initFromBaseUrl(apiBase)
-                        return@withContext "DIRECT:$apiBase"
-                    }
-                }
-            } catch (_: Exception) {
-                continue
-            }
-        }
-
-        Log.w(TAG, "Gateway discovery failed for $gatewayIp")
-        null
-    }
-
-    /**
-     * Legacy fallback: try hardcoded common camera IPs.
-     */
-    suspend fun tryHardcodedAddresses(): String? = withContext(Dispatchers.IO) {
-        val candidates = listOf(
-            "http://10.0.0.1:10000/sony/",
-            "http://192.168.122.1:10000/sony/",
-            "http://192.168.1.1:10000/sony/"
-        )
-        for (base in candidates) {
-            try {
-                val req = Request.Builder()
-                    .url("${base}camera")
-                    .post(
-                        """{"method":"getAvailableApiList","params":[],"id":1,"version":"1.0"}"""
-                            .toRequestBody("application/json".toMediaType())
-                    ).build()
-                val resp = client.newCall(req).execute()
-                if (resp.isSuccessful) {
-                    val body = resp.body?.string() ?: continue
-                    if (body.contains("\"result\"")) return@withContext base
-                }
-            } catch (_: Exception) { continue }
-        }
-        null
-    }
-
-    // ── Device Description Parsing ───────────────────────────────────
-
-    suspend fun initFromDescription(locationUrl: String): Result<String> =
-        withContext(Dispatchers.IO) {
-            try {
-                val req = Request.Builder().url(locationUrl).build()
-                val resp = client.newCall(req).execute()
-                val xml = resp.body?.string()
-                    ?: return@withContext Result.failure(Exception("Empty device description"))
-
-                Log.d(TAG, "Device description XML (first 500 chars): ${xml.take(500)}")
-
-                val modelName = Regex("<modelName>(.+?)</modelName>")
-                    .find(xml)?.groupValues?.get(1) ?: "Sony Camera"
-
-                val blockRx = Regex(
-                    "<av:X_ScalarWebAPI_Service>(.+?)</av:X_ScalarWebAPI_Service>",
-                    RegexOption.DOT_MATCHES_ALL
-                )
-                val typeRx =
-                    Regex("<av:X_ScalarWebAPI_ServiceType>(.+?)</av:X_ScalarWebAPI_ServiceType>")
-                val urlRx =
-                    Regex("<av:X_ScalarWebAPI_ActionList_URL>(.+?)</av:X_ScalarWebAPI_ActionList_URL>")
-
-                for (block in blockRx.findAll(xml)) {
-                    val content = block.groupValues[1]
-                    val type = typeRx.find(content)?.groupValues?.get(1) ?: continue
-                    val actionUrl = urlRx.find(content)?.groupValues?.get(1) ?: continue
-                    when (type) {
-                        "camera" -> cameraEndpoint = "$actionUrl/camera"
-                        "avContent" -> avContentEndpoint = "$actionUrl/avContent"
-                    }
-                }
-
-                if (cameraEndpoint == null && avContentEndpoint == null) {
-                    Result.failure(Exception("No API services found in XML"))
-                } else {
-                    Log.i(TAG, "Endpoints: camera=$cameraEndpoint avContent=$avContentEndpoint")
-                    Result.success(modelName)
-                }
-            } catch (e: Exception) {
-                Result.failure(e)
-            }
-        }
-
-    fun initFromBaseUrl(baseUrl: String) {
-        cameraEndpoint = "${baseUrl}camera"
-        avContentEndpoint = "${baseUrl}avContent"
-        Log.i(TAG, "initFromBaseUrl: camera=$cameraEndpoint avContent=$avContentEndpoint")
-    }
-
-    // ── JSON-RPC ─────────────────────────────────────────────────────
-
-    private fun rpc(
-        endpoint: String, method: String,
-        params: JSONArray = JSONArray(), version: String = "1.0"
-    ): JSONObject {
-        val body = JSONObject().apply {
-            put("method", method)
-            put("params", params)
-            put("id", requestId++)
-            put("version", version)
-        }
-        val req = Request.Builder()
-            .url(endpoint)
-            .post(body.toString().toRequestBody("application/json".toMediaType()))
-            .build()
-        val resp = client.newCall(req).execute()
-        val text = resp.body?.string() ?: throw Exception("Empty API response")
-        val json = JSONObject(text)
-        if (json.has("error")) {
-            val err = json.getJSONArray("error")
-            throw Exception("Camera API error ${err.optInt(0)}: ${err.optString(1)}")
-        }
-        return json
-    }
-
-    // ── Camera API Methods ───────────────────────────────────────────
-
-    suspend fun switchToTransferMode(): Result<Unit> = withContext(Dispatchers.IO) {
+    suspend fun checkReachable(): Boolean = withContext(Dispatchers.IO) {
         try {
-            val ep = cameraEndpoint
-                ?: return@withContext Result.failure(Exception("Camera endpoint unavailable"))
-            rpc(ep, "setCameraFunction", JSONArray().put("Contents Transfer"))
-            Result.success(Unit)
-        } catch (_: Exception) {
-            Result.success(Unit) // Camera may already be in transfer mode
-        }
-    }
-
-    suspend fun getContentCount(type: String = "still"): Result<Int> =
-        withContext(Dispatchers.IO) {
-            try {
-                val ep = avContentEndpoint
-                    ?: return@withContext Result.failure(Exception("avContent unavailable"))
-                val params = JSONArray().put(JSONObject().apply {
-                    put("uri", "storage:memoryCard1")
-                    put("type", JSONArray().put(type))
-                    put("view", "flat")
-                    put("target", "all")
-                })
-                val result = rpc(ep, "getContentCount", params, "1.2")
-                val count = result.getJSONArray("result").getJSONObject(0).getInt("count")
-                Result.success(count)
-            } catch (e: Exception) {
-                Result.failure(e)
-            }
-        }
-
-    suspend fun getContentList(
-        startIndex: Int = 0,
-        count: Int = 50,
-        type: String = "still"
-    ): Result<List<ContentItem>> = withContext(Dispatchers.IO) {
-        try {
-            val ep = avContentEndpoint
-                ?: return@withContext Result.failure(Exception("avContent unavailable"))
-
-            val params = JSONArray().put(JSONObject().apply {
-                put("uri", "storage:memoryCard1")
-                put("stIdx", startIndex)
-                put("cnt", count)
-                put("view", "flat")
-                put("sort", "descending")
-                put("type", JSONArray().put(type))
-            })
-
-            val result = rpc(ep, "getContentList", params, "1.3")
-            val items = mutableListOf<ContentItem>()
-            val arr = result.getJSONArray("result").getJSONArray(0)
-
-            for (i in 0 until arr.length()) {
-                val obj = arr.getJSONObject(i)
-                var originalUrl: String? = null
-                var fileSize: Long = 0
-                val content = obj.optJSONObject("content")
-                if (content != null) {
-                    val original = content.optJSONArray("original")
-                    if (original != null && original.length() > 0) {
-                        val orig = original.getJSONObject(0)
-                        originalUrl = orig.optString("url", "").ifEmpty { null }
-                        fileSize = orig.optLong("fileSize", 0)
-                    }
-                }
-                items.add(
-                    ContentItem(
-                        uri = obj.optString("uri", ""),
-                        contentKind = obj.optString("contentKind", "still"),
-                        title = obj.optString("title", "Untitled"),
-                        createdTime = obj.optString("createdTime", ""),
-                        thumbnailUrl = obj.optString("thumbnailUrl", "").ifEmpty { null },
-                        largeThumbnailUrl = obj.optString("largeThumbnailUrl", "").ifEmpty { null },
-                        originalUrl = originalUrl,
-                        fileSize = fileSize
-                    )
-                )
-            }
-            Result.success(items)
+            val req = Request.Builder().url("$baseUrl/DmsDescPush.xml").build()
+            val resp = client.newCall(req).execute()
+            val body = resp.body?.string() ?: return@withContext false
+            resp.isSuccessful && body.contains("SonyDigitalMediaServer")
         } catch (e: Exception) {
+            Log.w(TAG, "Reachability check failed: ${e.message}")
+            false
+        }
+    }
+
+    // ── SOAP: X_TransferStart ─────────────────────────────────────────
+
+    suspend fun startTransfer(): Result<Unit> = withContext(Dispatchers.IO) {
+        try {
+            val body = """<?xml version="1.0" encoding="utf-8"?>
+<s:Envelope xmlns:s="$nsSoap" s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/">
+<s:Body>
+<u:X_TransferStart xmlns:u="$nsXPushList"></u:X_TransferStart>
+</s:Body>
+</s:Envelope>""".trimIndent()
+
+            val req = Request.Builder()
+                .url(xPushListUrl)
+                .header("SOAPACTION", "\"$nsXPushList#X_TransferStart\"")
+                .header("Content-Type", "text/xml; charset=\"utf-8\"")
+                .post(body.toRequestBody("text/xml; charset=utf-8".toMediaType()))
+                .build()
+
+            val resp = client.newCall(req).execute()
+            Log.i(TAG, "TransferStart: HTTP ${resp.code}")
+            Result.success(Unit)
+        } catch (e: Exception) {
+            Log.w(TAG, "TransferStart failed: ${e.message}")
             Result.failure(e)
         }
     }
+
+    // ── SOAP: X_TransferEnd ───────────────────────────────────────────
+
+    suspend fun endTransfer(): Result<Unit> = withContext(Dispatchers.IO) {
+        try {
+            val body = """<?xml version="1.0" encoding="utf-8"?>
+<s:Envelope xmlns:s="$nsSoap" s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/">
+<s:Body>
+<u:X_TransferEnd xmlns:u="$nsXPushList">
+<SourceType>0</SourceType>
+</u:X_TransferEnd>
+</s:Body>
+</s:Envelope>""".trimIndent()
+
+            val req = Request.Builder()
+                .url(xPushListUrl)
+                .header("SOAPACTION", "\"$nsXPushList#X_TransferEnd\"")
+                .header("Content-Type", "text/xml; charset=\"utf-8\"")
+                .post(body.toRequestBody("text/xml; charset=utf-8".toMediaType()))
+                .build()
+
+            val resp = client.newCall(req).execute()
+            Log.i(TAG, "TransferEnd: HTTP ${resp.code}")
+            Result.success(Unit)
+        } catch (e: Exception) {
+            Log.w(TAG, "TransferEnd failed: ${e.message}")
+            Result.failure(e)
+        }
+    }
+
+    // ── SOAP: Browse (ContentDirectory) ───────────────────────────────
+
+    suspend fun browseDirectory(
+        objectId: String,
+        startingIndex: Int = 0,
+        requestedCount: Int = 100
+    ): Result<BrowseResult> = withContext(Dispatchers.IO) {
+        try {
+            val body = """<?xml version="1.0" encoding="utf-8"?>
+<s:Envelope xmlns:s="$nsSoap" s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/">
+<s:Body>
+<u:Browse xmlns:u="$nsContentDirectory">
+<ObjectID>$objectId</ObjectID>
+<BrowseFlag>BrowseDirectChildren</BrowseFlag>
+<Filter>*</Filter>
+<StartingIndex>$startingIndex</StartingIndex>
+<RequestedCount>$requestedCount</RequestedCount>
+<SortCriteria></SortCriteria>
+</u:Browse>
+</s:Body>
+</s:Envelope>""".trimIndent()
+
+            val req = Request.Builder()
+                .url(contentDirectoryUrl)
+                .header("SOAPACTION", "\"$nsContentDirectory#Browse\"")
+                .header("Content-Type", "text/xml; charset=\"utf-8\"")
+                .post(body.toRequestBody("text/xml; charset=utf-8".toMediaType()))
+                .build()
+
+            val resp = client.newCall(req).execute()
+            val xml = resp.body?.string()
+                ?: return@withContext Result.failure(Exception("Empty Browse response"))
+            Log.d(TAG, "Browse raw (first 300): ${xml.take(300)}")
+
+            parseBrowseResponse(xml)
+        } catch (e: Exception) {
+            Log.w(TAG, "Browse failed: ${e.message}")
+            Result.failure(e)
+        }
+    }
+
+    /**
+     * Recursively browse a directory tree, collecting all photo items.
+     */
+    suspend fun browseAll(rootId: String): Result<List<ContentItem>> =
+        withContext(Dispatchers.IO) {
+            try {
+                val allItems = mutableListOf<ContentItem>()
+                val queue = ArrayDeque<String>()
+                queue.add(rootId)
+
+                while (queue.isNotEmpty()) {
+                    val currentId = queue.removeFirst()
+                    var startIndex = 0
+
+                    // Paginate through all results in this directory
+                    while (true) {
+                        val result = browseDirectory(currentId, startIndex)
+                        if (result.isFailure) {
+                            Log.w(TAG, "Browse failed for $currentId at $startIndex: ${result.exceptionOrNull()?.message}")
+                            break
+                        }
+                        val br = result.getOrThrow()
+                        allItems.addAll(br.items)
+                        queue.addAll(br.containerIds)
+                        startIndex += br.numberReturned
+                        if (startIndex >= br.totalMatches || br.numberReturned == 0) break
+                    }
+                }
+
+                Log.i(TAG, "browseAll: collected ${allItems.size} items from $rootId")
+                Result.success(allItems)
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+
+    // ── DIDL-Lite Parsing ─────────────────────────────────────────────
+
+    private fun parseBrowseResponse(soapXml: String): Result<BrowseResult> {
+        try {
+            val factory = DocumentBuilderFactory.newInstance().apply {
+                isNamespaceAware = false
+            }
+            val builder = factory.newDocumentBuilder()
+
+            // Parse outer SOAP envelope
+            val doc = builder.parse(ByteArrayInputStream(soapXml.toByteArray(Charsets.UTF_8)))
+
+            // Extract <Result> which contains escaped DIDL-Lite XML
+            val resultNodes = doc.getElementsByTagName("Result")
+            if (resultNodes.length == 0) {
+                return Result.failure(Exception("No <Result> in Browse response"))
+            }
+            val didlLiteXml = resultNodes.item(0).textContent
+            Log.d(TAG, "DIDL-Lite (first 500): ${didlLiteXml.take(500)}")
+
+            // Parse the DIDL-Lite
+            val didlDoc = builder.parse(ByteArrayInputStream(didlLiteXml.toByteArray(Charsets.UTF_8)))
+
+            val items = mutableListOf<ContentItem>()
+            val containerIds = mutableListOf<String>()
+
+            // Collect containers (subdirectories)
+            val containerNodes = didlDoc.getElementsByTagName("container")
+            for (i in 0 until containerNodes.length) {
+                val elem = containerNodes.item(i) as Element
+                val id = elem.getAttribute("id")
+                if (id.isNotEmpty()) {
+                    containerIds.add(id)
+                    Log.d(TAG, "Found container: $id")
+                }
+            }
+
+            // Collect items (photos)
+            val itemNodes = didlDoc.getElementsByTagName("item")
+            for (i in 0 until itemNodes.length) {
+                val itemElem = itemNodes.item(i) as Element
+                val id = itemElem.getAttribute("id")
+
+                // Get title
+                val titleNodes = itemElem.getElementsByTagName("dc:title")
+                val title = if (titleNodes.length > 0)
+                    titleNodes.item(0).textContent else "Untitled"
+
+                // Get all <res> elements and find best URLs
+                val resNodes = itemElem.getElementsByTagName("res")
+                var bestUrl: String? = null
+                var bestSize: Long = 0
+                var thumbUrl: String? = null
+                var largeUrl: String? = null
+
+                for (j in 0 until resNodes.length) {
+                    val resElem = resNodes.item(j) as Element
+                    val url = resElem.textContent?.trim() ?: continue
+                    val size = resElem.getAttribute("size").toLongOrNull() ?: 0
+                    val protocolInfo = resElem.getAttribute("protocolInfo")
+
+                    // Classify by protocolInfo suffix
+                    when {
+                        protocolInfo.contains("_TN") -> thumbUrl = url
+                        protocolInfo.contains("_LRG") -> largeUrl = url
+                    }
+
+                    // Track largest = original
+                    if (size > bestSize) {
+                        bestSize = size
+                        bestUrl = url
+                    }
+                }
+
+                // Fallbacks for best URL
+                if (bestUrl == null) bestUrl = largeUrl ?: thumbUrl
+                if (thumbUrl == null) thumbUrl = largeUrl
+
+                items.add(ContentItem(
+                    id = id,
+                    title = title,
+                    thumbnailUrl = thumbUrl,
+                    largeUrl = largeUrl,
+                    originalUrl = bestUrl,
+                    fileSize = bestSize
+                ))
+            }
+
+            // Pagination info
+            val nrNodes = doc.getElementsByTagName("NumberReturned")
+            val tmNodes = doc.getElementsByTagName("TotalMatches")
+            val numberReturned = if (nrNodes.length > 0)
+                nrNodes.item(0).textContent.toIntOrNull() ?: 0 else 0
+            val totalMatches = if (tmNodes.length > 0)
+                tmNodes.item(0).textContent.toIntOrNull() ?: 0 else 0
+
+            Log.i(TAG, "Parsed: ${items.size} items, $numberReturned returned, $totalMatches total")
+            Result.success(BrowseResult(items, containerIds, numberReturned, totalMatches))
+        } catch (e: Exception) {
+            Log.w(TAG, "Parse failed: ${e.message}")
+            Result.failure(e)
+        }
+    }
+
+    // ── Download Photo ────────────────────────────────────────────────
 
     suspend fun downloadPhoto(
         url: String,
@@ -408,6 +377,4 @@ class SonyCameraClient {
             Result.failure(e)
         }
     }
-
-    fun hasAvContent(): Boolean = avContentEndpoint != null
 }
