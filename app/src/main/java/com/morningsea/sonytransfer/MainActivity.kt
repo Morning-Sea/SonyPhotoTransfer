@@ -459,21 +459,6 @@ fun GalleryGrid(
                 onClick = { onToggleSelect(index) }
             )
         }
-
-        // Loading indicator at bottom
-        if (isLoadingMore) {
-            item(span = { GridItemSpan(3) }) {
-                Box(
-                    modifier = Modifier.fillMaxWidth().padding(16.dp),
-                    contentAlignment = Alignment.Center
-                ) {
-                    CircularProgressIndicator(
-                        modifier = Modifier.size(28.dp),
-                        strokeWidth = 2.dp
-                    )
-                }
-            }
-        }
     }
 }
 
