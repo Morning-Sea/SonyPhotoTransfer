@@ -167,65 +167,113 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
                 // Don't return — let SSDP/fallback try anyway
             }
 
-            // === SSDP Discovery ===
-            _uiState.update { it.copy(statusMessage = "Searching for camera…") }
-            val ctx = getApplication<Application>()
-            var locationUrl = cameraClient.discover(ctx)
+            // === Camera Discovery (4-tier) ===
+            // Tier 1: SSDP multicast
+            // Tier 2: Gateway IP from DHCP + port scan
+            // Tier 3: Hardcoded common IPs
+            // Tier 4: Give up with helpful error
 
-            if (locationUrl == null) {
-                // Fallback: try common camera IPs
-                _uiState.update { it.copy(statusMessage = "SSDP timeout, trying common IPs…") }
-                val fallbackUrl = cameraClient.tryFallbackAddresses()
+            val ctx = getApplication<Application>()
+            var discovered = false
+
+            // Tier 1: SSDP
+            _uiState.update { it.copy(statusMessage = "SSDP searching…") }
+            val locationUrl = cameraClient.discover(ctx)
+
+            if (locationUrl != null) {
+                _uiState.update {
+                    it.copy(
+                        connectionState = ConnectionState.CONNECTING,
+                        statusMessage = "Found via SSDP, reading info…"
+                    )
+                }
+                val initResult = cameraClient.initFromDescription(locationUrl)
+                if (initResult.isSuccess) {
+                    _uiState.update { it.copy(modelName = initResult.getOrDefault("Sony Camera")) }
+                    discovered = true
+                }
+            }
+
+            // Tier 2: Gateway IP + port scan (most reliable on Chinese ROMs)
+            if (!discovered) {
+                val gwIp = cameraClient.getGatewayIp(ctx)
+                _uiState.update {
+                    it.copy(statusMessage = "Trying gateway IP ${gwIp ?: "N/A"}…")
+                }
+                val gwResult = cameraClient.tryGatewayDiscovery(ctx)
+                if (gwResult != null) {
+                    if (gwResult.startsWith("DIRECT:")) {
+                        // Already initialized via direct API call
+                        _uiState.update {
+                            it.copy(
+                                connectionState = ConnectionState.CONNECTING,
+                                modelName = "Sony Camera",
+                                statusMessage = "Found camera at $gwIp!"
+                            )
+                        }
+                        discovered = true
+                    } else {
+                        // Got device description URL, parse it
+                        val initResult = cameraClient.initFromDescription(gwResult)
+                        if (initResult.isSuccess) {
+                            _uiState.update {
+                                it.copy(
+                                    connectionState = ConnectionState.CONNECTING,
+                                    modelName = initResult.getOrDefault("Sony Camera"),
+                                    statusMessage = "Found camera!"
+                                )
+                            }
+                            discovered = true
+                        }
+                    }
+                }
+            }
+
+            // Tier 3: Hardcoded common IPs
+            if (!discovered) {
+                _uiState.update { it.copy(statusMessage = "Trying common IPs…") }
+                val fallbackUrl = cameraClient.tryHardcodedAddresses()
                 if (fallbackUrl != null) {
                     cameraClient.initFromBaseUrl(fallbackUrl)
                     _uiState.update {
                         it.copy(
                             connectionState = ConnectionState.CONNECTING,
                             modelName = "Sony Camera",
-                            statusMessage = "Found camera, connecting…"
+                            statusMessage = "Found camera via fallback!"
                         )
                     }
-                } else {
-                    _uiState.update {
-                        it.copy(
-                            connectionState = ConnectionState.ERROR,
-                            errorMessage = buildString {
-                                append("Camera not found.\n\n")
-                                if (!wifiBound) {
-                                    append("⚠ WiFi binding also failed.\n")
-                                    append("Try turning OFF mobile data, then retry.\n\n")
-                                }
-                                append("Steps:\n")
-                                append("1. Camera: Menu → Network → Send to Smartphone\n")
-                                append("2. Phone: Connect to camera WiFi\n")
-                                append("3. (Optional) Turn off mobile data\n")
-                                append("4. Tap Retry")
-                            },
-                            statusMessage = "Camera not found"
-                        )
-                    }
-                    return@launch
+                    discovered = true
                 }
-            } else {
-                // Parse device description XML
+            }
+
+            // Tier 4: Give up
+            if (!discovered) {
+                val gwIp = cameraClient.getGatewayIp(ctx)
                 _uiState.update {
                     it.copy(
-                        connectionState = ConnectionState.CONNECTING,
-                        statusMessage = "Found camera, reading info…"
+                        connectionState = ConnectionState.ERROR,
+                        errorMessage = buildString {
+                            append("Camera not found.\n\n")
+                            if (gwIp != null) {
+                                append("WiFi gateway: $gwIp\n")
+                                append("(API ports 10000/8080/64321 all unreachable)\n\n")
+                            } else {
+                                append("⚠ Cannot read WiFi gateway IP.\n\n")
+                            }
+                            if (!wifiBound) {
+                                append("⚠ WiFi binding also failed.\n")
+                                append("→ Turn OFF mobile data, then retry.\n\n")
+                            }
+                            append("Steps:\n")
+                            append("1. Camera: Menu → Network → Send to Smartphone\n")
+                            append("2. Phone: Connect to camera WiFi\n")
+                            append("3. Turn off mobile data\n")
+                            append("4. Tap Retry")
+                        },
+                        statusMessage = "Camera not found"
                     )
                 }
-                val initResult = cameraClient.initFromDescription(locationUrl)
-                if (initResult.isFailure) {
-                    _uiState.update {
-                        it.copy(
-                            connectionState = ConnectionState.ERROR,
-                            errorMessage = "Failed to read camera info:\n${initResult.exceptionOrNull()?.message}",
-                            statusMessage = "Connection failed"
-                        )
-                    }
-                    return@launch
-                }
-                _uiState.update { it.copy(modelName = initResult.getOrDefault("Sony Camera")) }
+                return@launch
             }
 
             // === Switch to Contents Transfer mode ===

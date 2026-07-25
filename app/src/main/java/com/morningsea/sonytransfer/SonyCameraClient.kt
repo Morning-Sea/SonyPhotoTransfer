@@ -3,6 +3,7 @@ package com.morningsea.sonytransfer
 import android.content.Context
 import android.net.Network
 import android.net.wifi.WifiManager
+import android.util.Log
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import okhttp3.MediaType.Companion.toMediaType
@@ -18,12 +19,11 @@ import java.net.InetAddress
 import java.net.SocketTimeoutException
 import java.util.concurrent.TimeUnit
 
-/**
- * Data class representing a photo/video on the camera's SD card.
- */
+private const val TAG = "SonyCam"
+
 data class ContentItem(
     val uri: String,
-    val contentKind: String,  // "still", "movie_mp4", etc.
+    val contentKind: String,
     val title: String,
     val createdTime: String,
     val thumbnailUrl: String?,
@@ -32,17 +32,6 @@ data class ContentItem(
     val fileSize: Long
 )
 
-/**
- * Client for Sony Camera Remote API (JSON-RPC over HTTP/WiFi).
- *
- * Protocol flow:
- * 1. Camera creates WiFi AP → phone connects
- * 2. SSDP M-SEARCH discovers camera IP & device description URL
- * 3. Parse XML to find /sony/camera and /sony/avContent endpoints
- * 4. setCameraFunction("Contents Transfer") on /sony/camera
- * 5. getContentList on /sony/avContent → browse photos
- * 6. HTTP GET on original URLs → download full-res photos
- */
 class SonyCameraClient {
 
     private var client: OkHttpClient = buildClient(null)
@@ -50,42 +39,48 @@ class SonyCameraClient {
     private var avContentEndpoint: String? = null
     private var requestId = 1
 
-    // ── Network Binding ──────────────────────────────────────────────
-    // On modern Android, when connected to a WiFi AP without internet
-    // (like the camera), the OS routes HTTP via mobile data instead.
-    // We must bind OkHttp to the WiFi network explicitly.
-
-    fun bindToNetwork(network: Network) {
-        client = buildClient(network)
-    }
-
+    fun bindToNetwork(network: Network) { client = buildClient(network) }
     fun getHttpClient(): OkHttpClient = client
 
     private fun buildClient(network: Network?): OkHttpClient {
         return OkHttpClient.Builder().apply {
             if (network != null) socketFactory(network.socketFactory)
-            connectTimeout(15, TimeUnit.SECONDS)
+            connectTimeout(10, TimeUnit.SECONDS)
             readTimeout(120, TimeUnit.SECONDS)
             writeTimeout(60, TimeUnit.SECONDS)
         }.build()
     }
 
+    // ── Get Camera IP from WiFi DHCP ─────────────────────────────────
+    // When phone connects to camera's WiFi AP, the gateway = camera IP.
+
+    fun getGatewayIp(context: Context): String? {
+        try {
+            val wm = context.applicationContext
+                .getSystemService(Context.WIFI_SERVICE) as WifiManager
+            val dhcp = wm.dhcpInfo ?: return null
+            val gw = dhcp.gateway
+            if (gw == 0) return null
+            // Android stores IP as little-endian int
+            val ip = "${gw and 0xFF}.${(gw shr 8) and 0xFF}.${(gw shr 16) and 0xFF}.${(gw shr 24) and 0xFF}"
+            Log.i(TAG, "DHCP gateway (camera IP): $ip")
+            return ip
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to get gateway IP: ${e.message}")
+            return null
+        }
+    }
+
     // ── SSDP Discovery ───────────────────────────────────────────────
 
-    /**
-     * Send SSDP M-SEARCH to find Sony camera on local network.
-     * Returns the LOCATION URL from the response (device description XML).
-     */
     suspend fun discover(context: Context, timeoutMs: Long = 6000): String? =
         withContext(Dispatchers.IO) {
-            // Acquire multicast lock so SSDP works on all devices
             val wifiManager =
                 context.applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
             val multicastLock = wifiManager.createMulticastLock("ssdp_discovery").apply {
                 setReferenceCounted(false)
                 acquire()
             }
-
             try {
                 val msg = ("M-SEARCH * HTTP/1.1\r\n" +
                         "HOST: 239.255.255.250:1900\r\n" +
@@ -98,37 +93,107 @@ class SonyCameraClient {
                     soTimeout = timeoutMs.toInt()
                     broadcast = true
                 }
-
                 val dest = InetAddress.getByName("239.255.255.250")
-                // Send multiple times for reliability
                 repeat(3) {
                     socket.send(DatagramPacket(msg, msg.size, dest, 1900))
                     Thread.sleep(80)
                 }
-
                 val buf = ByteArray(4096)
                 val recv = DatagramPacket(buf, buf.size)
                 try {
                     socket.receive(recv)
                     val response = String(recv.data, 0, recv.length)
+                    Log.i(TAG, "SSDP response: $response")
                     Regex("LOCATION:\\s*(.+?)\\r?\\n", RegexOption.IGNORE_CASE)
                         .find(response)?.groupValues?.get(1)?.trim()
                 } catch (_: SocketTimeoutException) {
+                    Log.w(TAG, "SSDP timed out")
                     null
                 } finally {
                     socket.close()
                 }
-            } catch (_: Exception) {
+            } catch (e: Exception) {
+                Log.w(TAG, "SSDP error: ${e.message}")
                 null
             } finally {
                 try { multicastLock.release() } catch (_: Exception) {}
             }
         }
 
+    // ── Smart Fallback: Gateway IP + Port Scan ───────────────────────
+
     /**
-     * Fallback: try common camera IP addresses when SSDP fails.
+     * Try to find the camera using the WiFi gateway IP + common ports.
+     * This is more reliable than SSDP on many Chinese ROM devices.
+     *
+     * Returns: the device description URL if found, or null.
      */
-    suspend fun tryFallbackAddresses(): String? = withContext(Dispatchers.IO) {
+    suspend fun tryGatewayDiscovery(context: Context): String? = withContext(Dispatchers.IO) {
+        val gatewayIp = getGatewayIp(context) ?: return@withContext null
+        Log.i(TAG, "Trying gateway IP: $gatewayIp")
+
+        // Sony cameras commonly use these ports
+        val ports = listOf(10000, 8080, 64321, 80)
+        // Common device description paths
+        val descPaths = listOf(
+            "/sony",                          // most common
+            "/sony/accessControl/DDService",  // some older models
+            ""                                // root
+        )
+
+        for (port in ports) {
+            // Strategy A: Try to fetch device description XML
+            for (path in descPaths) {
+                try {
+                    val url = "http://$gatewayIp:$port$path"
+                    Log.d(TAG, "Trying device description at: $url")
+                    val req = Request.Builder().url(url)
+                        .header("Connection", "close")
+                        .build()
+                    val resp = client.newCall(req).execute()
+                    val body = resp.body?.string() ?: continue
+                    // Check if response looks like Sony device description XML
+                    if (body.contains("ScalarWebAPI") || body.contains("sony")) {
+                        Log.i(TAG, "Found device description at $url")
+                        return@withContext url
+                    }
+                } catch (_: Exception) {
+                    continue
+                }
+            }
+
+            // Strategy B: Try direct JSON-RPC API call
+            try {
+                val apiBase = "http://$gatewayIp:$port/sony/"
+                val testReq = Request.Builder()
+                    .url("${apiBase}camera")
+                    .post(
+                        """{"method":"getAvailableApiList","params":[],"id":1,"version":"1.0"}"""
+                            .toRequestBody("application/json".toMediaType())
+                    ).build()
+                val resp = client.newCall(testReq).execute()
+                if (resp.isSuccessful) {
+                    val body = resp.body?.string() ?: continue
+                    if (body.contains("\"result\"")) {
+                        Log.i(TAG, "Found API at $apiBase via direct call")
+                        // Initialize directly since we confirmed the API works
+                        initFromBaseUrl(apiBase)
+                        return@withContext "DIRECT:$apiBase"
+                    }
+                }
+            } catch (_: Exception) {
+                continue
+            }
+        }
+
+        Log.w(TAG, "Gateway discovery failed for $gatewayIp")
+        null
+    }
+
+    /**
+     * Legacy fallback: try hardcoded common camera IPs.
+     */
+    suspend fun tryHardcodedAddresses(): String? = withContext(Dispatchers.IO) {
         val candidates = listOf(
             "http://10.0.0.1:10000/sony/",
             "http://192.168.122.1:10000/sony/",
@@ -147,19 +212,13 @@ class SonyCameraClient {
                     val body = resp.body?.string() ?: continue
                     if (body.contains("\"result\"")) return@withContext base
                 }
-            } catch (_: Exception) {
-                continue
-            }
+            } catch (_: Exception) { continue }
         }
         null
     }
 
     // ── Device Description Parsing ───────────────────────────────────
 
-    /**
-     * Fetch and parse the SSDP LOCATION XML to extract API endpoints.
-     * Returns camera model name on success.
-     */
     suspend fun initFromDescription(locationUrl: String): Result<String> =
         withContext(Dispatchers.IO) {
             try {
@@ -168,10 +227,11 @@ class SonyCameraClient {
                 val xml = resp.body?.string()
                     ?: return@withContext Result.failure(Exception("Empty device description"))
 
+                Log.d(TAG, "Device description XML (first 500 chars): ${xml.take(500)}")
+
                 val modelName = Regex("<modelName>(.+?)</modelName>")
                     .find(xml)?.groupValues?.get(1) ?: "Sony Camera"
 
-                // Parse service blocks (regex handles XML namespaces cleanly)
                 val blockRx = Regex(
                     "<av:X_ScalarWebAPI_Service>(.+?)</av:X_ScalarWebAPI_Service>",
                     RegexOption.DOT_MATCHES_ALL
@@ -192,8 +252,9 @@ class SonyCameraClient {
                 }
 
                 if (cameraEndpoint == null && avContentEndpoint == null) {
-                    Result.failure(Exception("No API services found in device description"))
+                    Result.failure(Exception("No API services found in XML"))
                 } else {
+                    Log.i(TAG, "Endpoints: camera=$cameraEndpoint avContent=$avContentEndpoint")
                     Result.success(modelName)
                 }
             } catch (e: Exception) {
@@ -201,15 +262,13 @@ class SonyCameraClient {
             }
         }
 
-    /**
-     * Initialize directly from a base URL (fallback path).
-     */
     fun initFromBaseUrl(baseUrl: String) {
         cameraEndpoint = "${baseUrl}camera"
         avContentEndpoint = "${baseUrl}avContent"
+        Log.i(TAG, "initFromBaseUrl: camera=$cameraEndpoint avContent=$avContentEndpoint")
     }
 
-    // ── JSON-RPC Helpers ─────────────────────────────────────────────
+    // ── JSON-RPC ─────────────────────────────────────────────────────
 
     private fun rpc(
         endpoint: String, method: String,
@@ -237,7 +296,6 @@ class SonyCameraClient {
 
     // ── Camera API Methods ───────────────────────────────────────────
 
-    /** Switch camera to Contents Transfer mode (required before browsing). */
     suspend fun switchToTransferMode(): Result<Unit> = withContext(Dispatchers.IO) {
         try {
             val ep = cameraEndpoint
@@ -245,12 +303,10 @@ class SonyCameraClient {
             rpc(ep, "setCameraFunction", JSONArray().put("Contents Transfer"))
             Result.success(Unit)
         } catch (_: Exception) {
-            // Camera may already be in transfer mode — proceed anyway
-            Result.success(Unit)
+            Result.success(Unit) // Camera may already be in transfer mode
         }
     }
 
-    /** Get total number of photos on the SD card. */
     suspend fun getContentCount(type: String = "still"): Result<Int> =
         withContext(Dispatchers.IO) {
             try {
@@ -263,15 +319,13 @@ class SonyCameraClient {
                     put("target", "all")
                 })
                 val result = rpc(ep, "getContentCount", params, "1.2")
-                val count =
-                    result.getJSONArray("result").getJSONObject(0).getInt("count")
+                val count = result.getJSONArray("result").getJSONObject(0).getInt("count")
                 Result.success(count)
             } catch (e: Exception) {
                 Result.failure(e)
             }
         }
 
-    /** Fetch a page of content items (photos). */
     suspend fun getContentList(
         startIndex: Int = 0,
         count: Int = 50,
@@ -296,7 +350,6 @@ class SonyCameraClient {
 
             for (i in 0 until arr.length()) {
                 val obj = arr.getJSONObject(i)
-
                 var originalUrl: String? = null
                 var fileSize: Long = 0
                 val content = obj.optJSONObject("content")
@@ -308,17 +361,14 @@ class SonyCameraClient {
                         fileSize = orig.optLong("fileSize", 0)
                     }
                 }
-
                 items.add(
                     ContentItem(
                         uri = obj.optString("uri", ""),
                         contentKind = obj.optString("contentKind", "still"),
                         title = obj.optString("title", "Untitled"),
                         createdTime = obj.optString("createdTime", ""),
-                        thumbnailUrl = obj.optString("thumbnailUrl", "")
-                            .ifEmpty { null },
-                        largeThumbnailUrl = obj.optString("largeThumbnailUrl", "")
-                            .ifEmpty { null },
+                        thumbnailUrl = obj.optString("thumbnailUrl", "").ifEmpty { null },
+                        largeThumbnailUrl = obj.optString("largeThumbnailUrl", "").ifEmpty { null },
                         originalUrl = originalUrl,
                         fileSize = fileSize
                     )
@@ -330,7 +380,6 @@ class SonyCameraClient {
         }
     }
 
-    /** Download a full-resolution photo with progress callback. */
     suspend fun downloadPhoto(
         url: String,
         onProgress: (bytesRead: Long, totalBytes: Long) -> Unit = { _, _ -> }
