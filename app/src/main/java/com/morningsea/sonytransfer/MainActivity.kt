@@ -68,7 +68,6 @@ import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.material3.darkColorScheme
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
-import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -168,9 +167,9 @@ fun SonyTransferApp(viewModel: CameraViewModel = viewModel()) {
                 title = {
                     Column {
                         Text("SonyTransfer", fontWeight = FontWeight.Bold, fontSize = 20.sp)
-                        AnimatedVisibility(state.modelName.isNotEmpty()) {
+                        AnimatedVisibility(visible = state.cameraIp.isNotEmpty()) {
                             Text(
-                                state.modelName,
+                                state.cameraIp,
                                 fontSize = 12.sp,
                                 color = MaterialTheme.colorScheme.primary
                             )
@@ -226,11 +225,8 @@ fun SonyTransferApp(viewModel: CameraViewModel = viewModel()) {
                 ConnectionState.READY -> GalleryGrid(
                     contents = state.contents,
                     selectedIndices = state.selectedIndices,
-                    hasMore = state.hasMore,
-                    isLoadingMore = state.isLoadingMore,
                     imageLoader = imageLoader,
-                    onToggleSelect = { viewModel.toggleSelection(it) },
-                    onLoadMore = { viewModel.loadMore() }
+                    onToggleSelect = { viewModel.toggleSelection(it) }
                 )
 
                 ConnectionState.ERROR -> ErrorScreen(
@@ -423,24 +419,10 @@ fun ErrorScreen(message: String, onRetry: () -> Unit) {
 fun GalleryGrid(
     contents: List<ContentItem>,
     selectedIndices: Set<Int>,
-    hasMore: Boolean,
-    isLoadingMore: Boolean,
     imageLoader: ImageLoader,
-    onToggleSelect: (Int) -> Unit,
-    onLoadMore: () -> Unit
+    onToggleSelect: (Int) -> Unit
 ) {
     val gridState = rememberLazyGridState()
-
-    // Auto-load more when scrolling near bottom
-    val shouldLoadMore by remember {
-        derivedStateOf {
-            val lastVisible = gridState.layoutInfo.visibleItemsInfo.lastOrNull()?.index ?: 0
-            lastVisible >= contents.size - 9 && hasMore && !isLoadingMore
-        }
-    }
-    LaunchedEffect(shouldLoadMore) {
-        if (shouldLoadMore) onLoadMore()
-    }
 
     if (contents.isEmpty()) {
         // Empty state
@@ -468,7 +450,7 @@ fun GalleryGrid(
     ) {
         itemsIndexed(
             items = contents,
-            key = { index, item -> "${index}_${item.uri}" }
+            key = { index, item -> "${index}_${item.id}" }
         ) { index, item ->
             PhotoGridItem(
                 item = item,

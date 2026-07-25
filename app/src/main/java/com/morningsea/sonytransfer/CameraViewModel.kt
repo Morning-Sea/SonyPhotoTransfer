@@ -9,6 +9,8 @@ import android.net.NetworkRequest
 import android.util.Log
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -352,9 +354,9 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
     // ── Disconnect ───────────────────────────────────────────────────
 
     fun disconnect() {
-        // End SOAP transfer session
+        // End SOAP transfer session (fire-and-forget on background thread)
         if (transferStarted) {
-            cameraClient.endTransfer()
+            CoroutineScope(Dispatchers.IO).launch { cameraClient.endTransfer() }
             transferStarted = false
         }
         // Unbind WiFi

@@ -246,7 +246,7 @@ class SonyCameraClient {
     // ── DIDL-Lite Parsing ─────────────────────────────────────────────
 
     private fun parseBrowseResponse(soapXml: String): Result<BrowseResult> {
-        try {
+        return try {
             val factory = DocumentBuilderFactory.newInstance().apply {
                 isNamespaceAware = false
             }
