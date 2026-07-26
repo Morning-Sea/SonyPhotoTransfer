@@ -33,6 +33,11 @@ private const val FMT_TIFF = 0x3802        // TIFF
 private const val FMT_RAW_SONY = 0xB101   // Sony ARW RAW
 private const val FMT_MP4 = 0x300D         // MP4 video
 private const val FMT_AVCHD = 0x3004       // AVCHD video
+// MTP video format codes (Sony may use these)
+private const val FMT_MTP_MP4 = 0xB981
+private const val FMT_MTP_3GP = 0xB988
+private const val FMT_MTP_3G2 = 0xB989
+private const val FMT_MTP_AVCHD = 0xB98A
 
 enum class PhotoType { JPEG, RAW, VIDEO, OTHER }
 
@@ -48,12 +53,27 @@ data class ContentItem(
     val photoType: PhotoType
 )
 
-/** Classify format code to photo type */
-private fun classifyFormat(code: Int): PhotoType = when (code) {
-    FMT_JPEG, FMT_TIFF -> PhotoType.JPEG
-    FMT_RAW_SONY -> PhotoType.RAW
-    FMT_MP4, FMT_AVCHD -> PhotoType.VIDEO
-    else -> PhotoType.OTHER
+/** Classify by format code + filename extension (extension is fallback) */
+private fun classifyFormat(code: Int, filename: String): PhotoType {
+    // Check format code first
+    when (code) {
+        FMT_JPEG, FMT_TIFF -> return PhotoType.JPEG
+        FMT_RAW_SONY -> return PhotoType.RAW
+        FMT_MP4, FMT_AVCHD, FMT_MTP_MP4, FMT_MTP_3GP, FMT_MTP_3G2, FMT_MTP_AVCHD -> return PhotoType.VIDEO
+        FMT_ASSOCIATION -> return PhotoType.OTHER // folder
+    }
+    // Fallback: check filename extension
+    val lower = filename.lowercase()
+    return when {
+        lower.endsWith(".mp4") || lower.endsWith(".mov") ||
+        lower.endsWith(".mts") || lower.endsWith(".m2ts") ||
+        lower.endsWith(".avi") -> PhotoType.VIDEO
+        lower.endsWith(".arw") -> PhotoType.RAW
+        lower.endsWith(".jpg") || lower.endsWith(".jpeg") -> PhotoType.JPEG
+        // If format code has IMAGE bit (0x0800), treat as image
+        (code and 0x0800) != 0 -> PhotoType.JPEG
+        else -> PhotoType.OTHER
+    }
 }
 
 class SonyCameraClient {
@@ -125,20 +145,23 @@ class SonyCameraClient {
                     try {
                         val info = session.getObjectInfo(handle)
                         val fmtCode = info.mObjectFormatCode.mValue
-                        val pType = classifyFormat(fmtCode)
+                        val fname = info.mFilename.mString
+                        val pType = classifyFormat(fmtCode, fname)
 
-                        // Skip folders (associations) and non-photo items
-                        if (pType == PhotoType.OTHER) {
-                            Log.d(TAG, "Skipping non-photo: ${info.mFilename.mString} (fmt=0x${fmtCode.toString(16)})")
+                        // Skip folders (associations) only — keep everything else
+                        if (fmtCode == FMT_ASSOCIATION) {
+                            Log.d(TAG, "Skipping folder: $fname")
                             continue
                         }
+
+                        Log.d(TAG, "Found: $fname fmt=0x${fmtCode.toString(16)} type=$pType size=${info.mObjectCompressedSize.mValue}")
 
                         val capDate = info.mCaptureDate.mDate
 
                         allItems.add(
                             ContentItem(
                                 handle = handle.mValue,
-                                filename = info.mFilename.mString.ifEmpty {
+                                filename = fname.ifEmpty {
                                     "IMG_${handle.mValue}"
                                 },
                                 fileSize = info.mObjectCompressedSize.mValue,
