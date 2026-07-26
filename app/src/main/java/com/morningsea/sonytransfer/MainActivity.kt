@@ -2,6 +2,8 @@ package com.morningsea.sonytransfer
 
 import android.Manifest
 import android.content.pm.PackageManager
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
 import android.os.Build
 import android.os.Bundle
 import androidx.activity.ComponentActivity
@@ -11,6 +13,7 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -70,12 +73,16 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
@@ -212,6 +219,7 @@ fun SonyTransferApp(viewModel: CameraViewModel = viewModel()) {
                 ConnectionState.READY -> GalleryGrid(
                     contents = state.contents,
                     selectedIndices = state.selectedIndices,
+                    loadThumbnail = { handle -> viewModel.loadThumbnail(handle) },
                     onToggleSelect = { viewModel.toggleSelection(it) }
                 )
 
@@ -405,6 +413,7 @@ fun ErrorScreen(message: String, onRetry: () -> Unit) {
 fun GalleryGrid(
     contents: List<ContentItem>,
     selectedIndices: Set<Int>,
+    loadThumbnail: suspend (Long) -> ByteArray?,
     onToggleSelect: (Int) -> Unit
 ) {
     val gridState = rememberLazyGridState()
@@ -439,6 +448,7 @@ fun GalleryGrid(
             PhotoGridItem(
                 item = item,
                 isSelected = index in selectedIndices,
+                loadThumbnail = loadThumbnail,
                 onClick = { onToggleSelect(index) }
             )
         }
@@ -453,9 +463,25 @@ fun GalleryGrid(
 fun PhotoGridItem(
     item: ContentItem,
     isSelected: Boolean,
+    loadThumbnail: suspend (Long) -> ByteArray?,
     onClick: () -> Unit
 ) {
     val shape = RoundedCornerShape(6.dp)
+
+    // Lazy-load thumbnail as Bitmap
+    val thumbnail: Bitmap? by produceState<Bitmap?>(null, item.handle) {
+        val bytes = loadThumbnail(item.handle)
+        value = bytes?.let { BitmapFactory.decodeByteArray(it, 0, it.size) }
+    }
+
+    // Format badge color and text
+    val (badgeColor, badgeText) = when (item.photoType) {
+        PhotoType.JPEG -> Color(0xFF2196F3) to "JPG"
+        PhotoType.RAW -> Color(0xFFFF7700) to "RAW"
+        PhotoType.VIDEO -> Color(0xFF4CAF50) to "VID"
+        PhotoType.OTHER -> Color.Gray to "???"
+    }
+
     Box(
         modifier = Modifier
             .padding(2.dp)
@@ -465,41 +491,54 @@ fun PhotoGridItem(
             .clickable(onClick = onClick)
             .then(
                 if (isSelected) Modifier.border(
-                    3.dp,
-                    MaterialTheme.colorScheme.primary,
-                    shape
-                )
-                else Modifier
+                    3.dp, MaterialTheme.colorScheme.primary, shape
+                ) else Modifier
             )
     ) {
-        Column(
-            modifier = Modifier.fillMaxSize().padding(4.dp),
-            horizontalAlignment = Alignment.CenterHorizontally,
-            verticalArrangement = Arrangement.Center
-        ) {
-            Icon(
-                Icons.Default.PhotoLibrary, null,
-                tint = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.5f),
-                modifier = Modifier.size(28.dp)
+        // Thumbnail image (or placeholder)
+        if (thumbnail != null) {
+            Image(
+                bitmap = thumbnail!!.asImageBitmap(),
+                contentDescription = item.filename,
+                contentScale = ContentScale.Crop,
+                modifier = Modifier.fillMaxSize()
             )
-            Spacer(Modifier.height(4.dp))
-            Text(
-                item.filename,
-                fontSize = 9.sp,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                maxLines = 2,
-                overflow = TextOverflow.Ellipsis,
-                textAlign = TextAlign.Center,
-                fontWeight = FontWeight.Medium
-            )
-            if (item.fileSize > 0) {
+        } else {
+            // Loading placeholder
+            Column(
+                modifier = Modifier.fillMaxSize(),
+                horizontalAlignment = Alignment.CenterHorizontally,
+                verticalArrangement = Arrangement.Center
+            ) {
+                Icon(
+                    Icons.Default.PhotoLibrary, null,
+                    tint = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.3f),
+                    modifier = Modifier.size(32.dp)
+                )
+                Spacer(Modifier.height(4.dp))
                 Text(
-                    formatFileSize(item.fileSize),
+                    item.filename,
                     fontSize = 8.sp,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f)
+                    color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.5f),
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    textAlign = TextAlign.Center
                 )
             }
         }
+
+        // Format badge (top-left)
+        Text(
+            badgeText,
+            fontSize = 8.sp,
+            fontWeight = FontWeight.Bold,
+            color = Color.White,
+            modifier = Modifier
+                .align(Alignment.TopStart)
+                .padding(2.dp)
+                .background(badgeColor, RoundedCornerShape(2.dp))
+                .padding(horizontal = 4.dp, vertical = 1.dp)
+        )
 
         // Selection indicator (top-right)
         Box(modifier = Modifier.align(Alignment.TopEnd).padding(4.dp)) {
@@ -520,18 +559,35 @@ fun PhotoGridItem(
             }
         }
 
-        // Dimensions badge (bottom-left)
-        if (item.imageWidth > 0) {
-            Text(
-                "${item.imageWidth}×${item.imageHeight}",
-                fontSize = 7.sp,
-                color = Color.White,
-                modifier = Modifier
-                    .align(Alignment.BottomStart)
-                    .padding(2.dp)
-                    .background(Color.Black.copy(alpha = 0.5f), RoundedCornerShape(2.dp))
-                    .padding(horizontal = 3.dp, vertical = 1.dp)
-            )
+        // Bottom gradient with filename + size
+        Box(
+            modifier = Modifier
+                .align(Alignment.BottomCenter)
+                .fillMaxWidth()
+                .background(
+                    Brush.verticalGradient(
+                        colors = listOf(Color.Transparent, Color.Black.copy(alpha = 0.75f))
+                    )
+                )
+                .padding(horizontal = 4.dp, vertical = 3.dp)
+        ) {
+            Column {
+                Text(
+                    item.filename,
+                    fontSize = 9.sp,
+                    color = Color.White,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    fontWeight = FontWeight.Medium
+                )
+                if (item.fileSize > 0) {
+                    Text(
+                        formatFileSize(item.fileSize),
+                        fontSize = 7.sp,
+                        color = Color.White.copy(alpha = 0.7f)
+                    )
+                }
+            }
         }
     }
 }

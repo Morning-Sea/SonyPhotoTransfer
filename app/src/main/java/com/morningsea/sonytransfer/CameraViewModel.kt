@@ -292,10 +292,19 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
 
                 if (result.isSuccess) {
                     val data = result.getOrThrow()
-                    val filename = item.filename.ifEmpty { "IMG_${item.handle}.JPG" }
-                    val safeName = if ('.' in filename) filename else "$filename.JPG"
+                    // Determine filename with correct extension
+                    val filename = item.filename.ifEmpty { "IMG_${item.handle}" }
+                    val (safeName, mediaType) = when (item.photoType) {
+                        PhotoType.JPEG -> if ('.' in filename) filename to MediaSaver.MediaType.IMAGE
+                                         else "$filename.JPG" to MediaSaver.MediaType.IMAGE
+                        PhotoType.RAW -> if (filename.contains(".arw", true)) filename to MediaSaver.MediaType.IMAGE
+                                         else "$filename.ARW" to MediaSaver.MediaType.IMAGE
+                        PhotoType.VIDEO -> if ('.' in filename) filename to MediaSaver.MediaType.VIDEO
+                                           else "$filename.MP4" to MediaSaver.MediaType.VIDEO
+                        PhotoType.OTHER -> filename to MediaSaver.MediaType.IMAGE
+                    }
 
-                    MediaSaver.saveImage(getApplication(), data, safeName)
+                    MediaSaver.saveFile(getApplication(), data, safeName, mediaType)
                     ok++
                     _uiState.update { it.copy(downloadedCount = ok) }
                 }

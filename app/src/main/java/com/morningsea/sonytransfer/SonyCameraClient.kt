@@ -7,24 +7,18 @@ import android.util.Log
 import com.fimagena.libptp.PtpConnection
 import com.fimagena.libptp.PtpDataType
 import com.fimagena.libptp.PtpSession
-import com.fimagena.libptp.PtpTransport
 import com.fimagena.libptp.ptpip.PtpIpConnection
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import java.net.InetAddress
+import java.util.Date
 
 private const val TAG = "SonyCam"
 
-/** JPEG object format code in PTP standard */
-private const val FORMAT_JPEG = 0xB101
-
-/** PTP/IP standard port (confirmed open on ZV-E10) */
+/** PTP/IP standard port */
 private const val PTP_PORT = 15740
 
-/**
- * Any 16-byte GUID works for Sony cameras (pairing unnecessary).
- * Using the same pattern as libptp's PtpTester.
- */
+/** Any 16-byte GUID works for Sony cameras (pairing unnecessary) */
 private val PTP_GUID = shortArrayOf(
     0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
     0xff.toShort(), 0xff.toShort(), 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
@@ -32,45 +26,44 @@ private val PTP_GUID = shortArrayOf(
 
 private const val FRIENDLY_NAME = "SonyTransfer"
 
+// PTP Object Format Codes
+private const val FMT_ASSOCIATION = 0x3001  // folder
+private const val FMT_JPEG = 0x3801        // JPEG/EXIF
+private const val FMT_TIFF = 0x3802        // TIFF
+private const val FMT_RAW_SONY = 0xB101   // Sony ARW RAW
+private const val FMT_MP4 = 0x300D         // MP4 video
+private const val FMT_AVCHD = 0x3004       // AVCHD video
+
+enum class PhotoType { JPEG, RAW, VIDEO, OTHER }
+
 data class ContentItem(
-    val handle: Long,           // PTP object handle
-    val filename: String,       // e.g. "DSC00123.JPG"
-    val fileSize: Long,         // compressed size in bytes
-    val imageWidth: Int,        // pixels
-    val imageHeight: Int,       // pixels
-    val thumbFormat: Int        // format code for thumbnail
+    val handle: Long,
+    val filename: String,
+    val fileSize: Long,
+    val imageWidth: Int,
+    val imageHeight: Int,
+    val thumbFormat: Int,
+    val formatCode: Int,
+    val captureDate: Date?,
+    val photoType: PhotoType
 )
 
-/**
- * Sony Camera Client using PTP/IP protocol (port 15740).
- *
- * The ZV-E10 (firmware 2.02) uses PTP/IP (ISO 15740) for photo transfer,
- * NOT the SOAP/UPnP protocol on port 64321 (which returns 404 on newer firmware).
- *
- * Protocol flow (via libptp library):
- * 1. PtpIpConnection → connect to camera at ip:15740
- * 2. openSession()
- * 3. getStorageIDs() → get SD card storage IDs
- * 4. getObjectHandles(storageId, FORMAT_JPEG) → get all JPEG photo handles
- * 5. getObjectInfo(handle) → get filename, size, dimensions
- * 6. getThumb(handle) → download thumbnail bytes
- * 7. getObject(handle) → download full photo bytes
- */
+/** Classify format code to photo type */
+private fun classifyFormat(code: Int): PhotoType = when (code) {
+    FMT_JPEG, FMT_TIFF -> PhotoType.JPEG
+    FMT_RAW_SONY -> PhotoType.RAW
+    FMT_MP4, FMT_AVCHD -> PhotoType.VIDEO
+    else -> PhotoType.OTHER
+}
+
 class SonyCameraClient {
 
     private var ptpConnection: PtpConnection? = null
     private var ptpSession: PtpSession? = null
 
-    // ── WiFi Network Binding ────────────────────────────────────────
-    // bindProcessToNetwork() is called by the ViewModel.
-    // PTP/IP uses raw java.net.Socket which respects process binding.
-
     fun bindToNetwork(network: Network) {
-        // No-op: process-level binding via ConnectivityManager.bindProcessToNetwork()
-        // in the ViewModel covers raw sockets too.
+        // No-op: process-level binding via ConnectivityManager covers raw sockets
     }
-
-    // ── Get Camera IP from WiFi DHCP ─────────────────────────────────
 
     fun getGatewayIp(context: Context): String? {
         try {
@@ -81,7 +74,6 @@ class SonyCameraClient {
             if (gw == 0) return null
             return "${gw and 0xFF}.${(gw shr 8) and 0xFF}.${(gw shr 16) and 0xFF}.${(gw shr 24) and 0xFF}"
         } catch (e: Exception) {
-            Log.w(TAG, "Failed to get gateway IP: ${e.message}")
             return null
         }
     }
@@ -91,29 +83,18 @@ class SonyCameraClient {
     suspend fun connectToCamera(ip: String): Result<String> = withContext(Dispatchers.IO) {
         try {
             Log.i(TAG, "Connecting to PTP/IP at $ip:$PTP_PORT")
-
-            val address = PtpIpConnection.PtpIpAddress(
-                InetAddress.getByName(ip), PTP_PORT
-            )
-            val hostId = PtpIpConnection.PtpIpHostId(
-                PTP_GUID, FRIENDLY_NAME
-            )
+            val address = PtpIpConnection.PtpIpAddress(InetAddress.getByName(ip), PTP_PORT)
+            val hostId = PtpIpConnection.PtpIpHostId(PTP_GUID, FRIENDLY_NAME)
             val transport = PtpIpConnection()
             val connection = PtpConnection(transport)
-
             connection.connect(address, hostId)
             ptpConnection = connection
             Log.i(TAG, "PTP/IP connected, opening session...")
-
             val session = connection.openSession()
             ptpSession = session
             Log.i(TAG, "PTP session opened")
-
-            // Get device info for model name
             val deviceInfo = connection.deviceInfo
             val modelName = deviceInfo?.mModel?.mString ?: "Sony Camera"
-            Log.i(TAG, "Camera model: $modelName")
-
             Result.success(modelName)
         } catch (e: Exception) {
             Log.e(TAG, "PTP connect failed: ${e.javaClass.simpleName}: ${e.message}")
@@ -121,12 +102,11 @@ class SonyCameraClient {
         }
     }
 
-    // ── List All Photos ──────────────────────────────────────────────
+    // ── List All Photos (JPEG + RAW + Video) ────────────────────────
 
     suspend fun getPhotoList(): Result<List<ContentItem>> = withContext(Dispatchers.IO) {
         val session = ptpSession
             ?: return@withContext Result.failure(Exception("No PTP session"))
-
         try {
             val storageIds = session.storageIDs
             Log.i(TAG, "Found ${storageIds.size} storage(s)")
@@ -135,18 +115,26 @@ class SonyCameraClient {
 
             for (storageId in storageIds) {
                 val sid = storageId.mValue
-                Log.i(TAG, "Storage $sid: getting handles...")
+                Log.i(TAG, "Storage $sid: getting ALL handles (no format filter)...")
 
-                // Get JPEG photo handles (format 0xB101)
-                val handles = session.getObjectHandles(
-                    storageId,
-                    PtpDataType.ObjectFormatCode(FORMAT_JPEG)
-                )
-                Log.i(TAG, "Storage $sid: ${handles.size} JPEG objects")
+                // Get ALL objects (no format filter) - includes JPEG, RAW, video, folders
+                val handles = session.getObjectHandles(storageId)
+                Log.i(TAG, "Storage $sid: ${handles.size} total objects")
 
                 for (handle in handles) {
                     try {
                         val info = session.getObjectInfo(handle)
+                        val fmtCode = info.mObjectFormatCode.mValue
+                        val pType = classifyFormat(fmtCode)
+
+                        // Skip folders (associations) and non-photo items
+                        if (pType == PhotoType.OTHER) {
+                            Log.d(TAG, "Skipping non-photo: ${info.mFilename.mString} (fmt=0x${fmtCode.toString(16)})")
+                            continue
+                        }
+
+                        val capDate = info.mCaptureDate.mDate
+
                         allItems.add(
                             ContentItem(
                                 handle = handle.mValue,
@@ -156,7 +144,10 @@ class SonyCameraClient {
                                 fileSize = info.mObjectCompressedSize.mValue,
                                 imageWidth = info.mImagePixWidth.mValue.toInt(),
                                 imageHeight = info.mImagePixHeight.mValue.toInt(),
-                                thumbFormat = info.mThumbFormat.mValue
+                                thumbFormat = info.mThumbFormat.mValue,
+                                formatCode = fmtCode,
+                                captureDate = capDate,
+                                photoType = pType
                             )
                         )
                     } catch (e: Exception) {
@@ -165,7 +156,10 @@ class SonyCameraClient {
                 }
             }
 
-            Log.i(TAG, "Total: ${allItems.size} photos")
+            // Sort by capture date descending (newest first)
+            allItems.sortByDescending { it.captureDate?.time ?: 0L }
+
+            Log.i(TAG, "Total: ${allItems.size} photos/videos")
             Result.success(allItems)
         } catch (e: Exception) {
             Log.e(TAG, "getPhotoList failed: ${e.message}")
@@ -209,8 +203,6 @@ class SonyCameraClient {
         }
     }
 
-    // ── Get file size for a handle (for progress) ────────────────────
-
     suspend fun getObjectSize(handle: Long): Long = withContext(Dispatchers.IO) {
         val session = ptpSession ?: return@withContext 0L
         try {
@@ -219,19 +211,9 @@ class SonyCameraClient {
         } catch (_: Exception) { 0L }
     }
 
-    // ── Disconnect ───────────────────────────────────────────────────
-
     fun disconnect() {
-        try {
-            ptpSession?.close()
-        } catch (e: Exception) {
-            Log.w(TAG, "Session close error: ${e.message}")
-        }
-        try {
-            ptpConnection?.close()
-        } catch (e: Exception) {
-            Log.w(TAG, "Connection close error: ${e.message}")
-        }
+        try { ptpSession?.close() } catch (_: Exception) {}
+        try { ptpConnection?.close() } catch (_: Exception) {}
         ptpSession = null
         ptpConnection = null
         Log.i(TAG, "PTP disconnected")
