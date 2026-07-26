@@ -234,6 +234,7 @@ class SonyCameraClient {
 
     // ── Stream Download to OutputStream (for large files like video) ──
     // Uses GetPartialObject to download in chunks, avoiding OOM.
+    // Falls back to GetObject (in-memory) if GetPartialObject not supported.
 
     suspend fun downloadPhotoToStream(
         handle: Long,
@@ -244,8 +245,36 @@ class SonyCameraClient {
         val session = ptpSession
             ?: return@withContext Result.failure(Exception("No PTP session"))
         try {
-            val chunkSize = 4L * 1024 * 1024 // 4MB per chunk
-            var offset = 0L
+            val chunkSize = 2L * 1024 * 1024 // 2MB per chunk
+
+            // Test if GetPartialObject is supported with a tiny probe chunk
+            val testResult = runCatching {
+                session.getPartialObject(
+                    PtpDataType.ObjectHandle(handle), 0L, 1024L, null
+                )
+            }
+
+            if (testResult.isFailure) {
+                // Camera doesn't support GetPartialObject — fall back to GetObject
+                Log.w(TAG, "GetPartialObject not supported (${testResult.exceptionOrNull()?.message}), falling back to GetObject")
+                val data = session.getObject(
+                    PtpDataType.ObjectHandle(handle),
+                    object : PtpSession.DataLoadListener {
+                        override fun onDataLoaded(loaded: Long, expected: Long) {
+                            onProgress(loaded, expected)
+                        }
+                    }
+                )
+                outputStream.write(data)
+                outputStream.flush()
+                return@withContext Result.success(Unit)
+            }
+
+            // GetPartialObject is supported — stream in chunks
+            val firstChunk = testResult.getOrThrow()
+            outputStream.write(firstChunk)
+            var offset = firstChunk.size.toLong()
+            onProgress(offset, totalSize)
 
             while (offset < totalSize) {
                 val remaining = totalSize - offset
@@ -253,24 +282,21 @@ class SonyCameraClient {
 
                 val chunk = session.getPartialObject(
                     PtpDataType.ObjectHandle(handle),
-                    offset, maxBytes
-                ) { loaded, _ ->
-                    onProgress(offset + loaded, totalSize)
-                }
+                    offset, maxBytes,
+                    null
+                )
 
+                if (chunk.isEmpty()) break
                 outputStream.write(chunk)
                 offset += chunk.size
                 onProgress(offset, totalSize)
-
-                // Safety check: if chunk is empty, break to avoid infinite loop
-                if (chunk.isEmpty()) break
             }
 
             outputStream.flush()
-            Log.i(TAG, "Streamed $offset bytes to output stream")
+            Log.i(TAG, "Streamed $offset / $totalSize bytes")
             Result.success(Unit)
         } catch (e: Exception) {
-            Log.e(TAG, "Stream download failed at offset: ${e.message}")
+            Log.e(TAG, "Stream download failed: ${e.message}")
             Result.failure(e)
         }
     }

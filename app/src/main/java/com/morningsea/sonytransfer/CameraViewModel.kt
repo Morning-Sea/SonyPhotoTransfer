@@ -362,7 +362,8 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
 
     // ── Thumbnail Loading (for UI) ──────────────────────────────────
 
-    private val _thumbnailCache = mutableMapOf<Long, ByteArray>()
+    // Thread-safe thumbnail cache (multiple produceState coroutines access concurrently)
+    private val _thumbnailCache = java.util.concurrent.ConcurrentHashMap<Long, ByteArray>()
 
     suspend fun loadThumbnail(handle: Long): ByteArray? {
         _thumbnailCache[handle]?.let { return it }
