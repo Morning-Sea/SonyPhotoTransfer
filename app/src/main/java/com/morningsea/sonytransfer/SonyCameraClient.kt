@@ -233,8 +233,8 @@ class SonyCameraClient {
     }
 
     // ── Stream Download to OutputStream (for large files like video) ──
-    // Uses GetPartialObject to download in chunks, avoiding OOM.
-    // Falls back to GetObject (in-memory) if GetPartialObject not supported.
+    // ZV-E10's GetPartialObject only works for offset=0 (non-standard impl),
+    // so we use GetObject (loads full file) with largeHeap for memory headroom.
 
     suspend fun downloadPhotoToStream(
         handle: Long,
@@ -245,58 +245,24 @@ class SonyCameraClient {
         val session = ptpSession
             ?: return@withContext Result.failure(Exception("No PTP session"))
         try {
-            val chunkSize = 2L * 1024 * 1024 // 2MB per chunk
-
-            // Test if GetPartialObject is supported with a tiny probe chunk
-            val testResult = runCatching {
-                session.getPartialObject(
-                    PtpDataType.ObjectHandle(handle), 0L, 1024L, null
-                )
-            }
-
-            if (testResult.isFailure) {
-                // Camera doesn't support GetPartialObject — fall back to GetObject
-                Log.w(TAG, "GetPartialObject not supported (${testResult.exceptionOrNull()?.message}), falling back to GetObject")
-                val data = session.getObject(
-                    PtpDataType.ObjectHandle(handle),
-                    object : PtpSession.DataLoadListener {
-                        override fun onDataLoaded(loaded: Long, expected: Long) {
-                            onProgress(loaded, expected)
-                        }
+            Log.i(TAG, "GetObject for $handle (${totalSize / 1024 / 1024}MB)")
+            val data = session.getObject(
+                PtpDataType.ObjectHandle(handle),
+                object : PtpSession.DataLoadListener {
+                    override fun onDataLoaded(loaded: Long, expected: Long) {
+                        onProgress(loaded, if (expected > 0) expected else totalSize)
                     }
-                )
-                outputStream.write(data)
-                outputStream.flush()
-                return@withContext Result.success(Unit)
-            }
-
-            // GetPartialObject is supported — stream in chunks
-            val firstChunk = testResult.getOrThrow()
-            outputStream.write(firstChunk)
-            var offset = firstChunk.size.toLong()
-            onProgress(offset, totalSize)
-
-            while (offset < totalSize) {
-                val remaining = totalSize - offset
-                val maxBytes = minOf(chunkSize, remaining)
-
-                val chunk = session.getPartialObject(
-                    PtpDataType.ObjectHandle(handle),
-                    offset, maxBytes,
-                    null
-                )
-
-                if (chunk.isEmpty()) break
-                outputStream.write(chunk)
-                offset += chunk.size
-                onProgress(offset, totalSize)
-            }
-
+                }
+            )
+            outputStream.write(data)
             outputStream.flush()
-            Log.i(TAG, "Streamed $offset / $totalSize bytes")
+            Log.i(TAG, "GetObject done: ${data.size} bytes")
             Result.success(Unit)
+        } catch (e: OutOfMemoryError) {
+            Log.e(TAG, "OOM downloading ${totalSize / 1024 / 1024}MB file: ${e.message}")
+            Result.failure(Exception("File too large for device memory (${totalSize / 1024 / 1024}MB). Try downloading smaller files."))
         } catch (e: Exception) {
-            Log.e(TAG, "Stream download failed: ${e.message}")
+            Log.e(TAG, "Download failed: ${e.message}")
             Result.failure(e)
         }
     }

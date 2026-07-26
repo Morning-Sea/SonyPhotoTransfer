@@ -298,26 +298,36 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
                 Log.i("CameraVM", "Downloading ${item.filename} size=$totalSize streaming=$useStreaming")
 
                 val success = if (useStreaming) {
-                    // Stream download — chunks written directly to MediaStore
                     val streamResult = MediaSaver.openOutputStream(getApplication(), safeName, mediaType)
                     if (streamResult.isFailure) {
                         Log.w("CameraVM", "Failed to open stream: ${streamResult.exceptionOrNull()?.message}")
                         false
                     } else {
-                        val handle = streamResult.getOrThrow()
+                        val streamHandle = streamResult.getOrThrow()
                         val dlResult = cameraClient.downloadPhotoToStream(
-                            item.handle, totalSize, handle.stream
+                            item.handle, totalSize, streamHandle.stream
                         ) { read, total ->
                             if (total > 0) {
                                 _uiState.update { it.copy(downloadProgress = read.toFloat() / total) }
                             }
                         }
-                        try { handle.stream.close() } catch (_: Exception) {}
+                        try { streamHandle.stream.close() } catch (_: Exception) {}
                         if (dlResult.isSuccess) {
-                            MediaSaver.finalizePendingUri(getApplication(), handle.uri)
+                            MediaSaver.finalizePendingUri(getApplication(), streamHandle.uri)
                             true
                         } else {
+                            // Clean up failed MediaStore entry
+                            if (streamHandle.uri.startsWith("content://")) {
+                                try {
+                                    getApplication<Application>().contentResolver.delete(
+                                        android.net.Uri.parse(streamHandle.uri), null, null
+                                    )
+                                } catch (_: Exception) {}
+                            }
                             Log.w("CameraVM", "Stream download failed: ${dlResult.exceptionOrNull()?.message}")
+                            _uiState.update {
+                                it.copy(statusMessage = "❌ ${dlResult.exceptionOrNull()?.message ?: "Download failed"}")
+                            }
                             false
                         }
                     }
