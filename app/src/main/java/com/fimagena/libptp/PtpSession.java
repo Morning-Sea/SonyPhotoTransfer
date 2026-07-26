@@ -132,6 +132,25 @@ public class PtpSession {
         return ((PtpDataType.Object) response.getData()).mObject;
     }
 
+    /**
+     * GetPartialObject — downloads a chunk of an object (offset + maxBytes).
+     * Added for streaming large video downloads to avoid OOM.
+     * Returns the byte chunk for the specified range.
+     */
+    public byte[] getPartialObject(PtpDataType.ObjectHandle objectHandle, long offset, long maxBytes, final DataLoadListener listener) throws PtpTransport.TransportError, PtpExceptions.PtpProtocolViolation, PtpExceptions.OperationFailed {
+        PtpOperation.Request request = PtpOperation.createRequest(PtpOperation.OPSCODE_GetPartialObject);
+        if (request == null)
+            throw new PtpExceptions.OperationFailed("GetPartialObject not supported", 0x2005);
+        request.mParameters = new long[]{objectHandle.mValue, offset, maxBytes};
+        PtpOperation.Response response = mSession.executeTransaction(request, listener == null ? null : new PtpTransport.Session.DataLoadListener() {
+            @Override public void onDataLoaded(PtpOperation.Request request, long loaded, long expected) {listener.onDataLoaded(loaded, expected);}
+        });
+        response.validate();
+        if (!response.isSuccess())
+            throw new PtpExceptions.OperationFailed("GetPartialObject", response.getResponseCode());
+        return ((PtpDataType.Object) response.getData()).mObject;
+    }
+
     // FIXME: need to check for IMAGE, since (Sony) camera might stop otherwise...
     public byte[] getThumb(PtpDataType.ObjectHandle objectHandle) throws PtpTransport.TransportError, PtpExceptions.PtpProtocolViolation, PtpExceptions.OperationFailed {
         return getThumb(objectHandle, null);

@@ -197,13 +197,19 @@ class SonyCameraClient {
             ?: return@withContext Result.failure(Exception("No PTP session"))
         try {
             val thumb = session.getThumb(PtpDataType.ObjectHandle(handle))
-            Result.success(thumb)
+            if (thumb == null || thumb.isEmpty()) {
+                Result.failure(Exception("Empty thumbnail"))
+            } else {
+                Result.success(thumb)
+            }
         } catch (e: Exception) {
+            // Videos often don't have thumbnails — that's fine
+            Log.d(TAG, "getThumb failed for $handle: ${e.message}")
             Result.failure(e)
         }
     }
 
-    // ── Download Full Photo ──────────────────────────────────────────
+    // ── Download Full Photo (in-memory, for small files) ─────────────
 
     suspend fun downloadPhoto(
         handle: Long,
@@ -222,6 +228,49 @@ class SonyCameraClient {
             )
             Result.success(data)
         } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+
+    // ── Stream Download to OutputStream (for large files like video) ──
+    // Uses GetPartialObject to download in chunks, avoiding OOM.
+
+    suspend fun downloadPhotoToStream(
+        handle: Long,
+        totalSize: Long,
+        outputStream: java.io.OutputStream,
+        onProgress: (bytesRead: Long, totalBytes: Long) -> Unit
+    ): Result<Unit> = withContext(Dispatchers.IO) {
+        val session = ptpSession
+            ?: return@withContext Result.failure(Exception("No PTP session"))
+        try {
+            val chunkSize = 4L * 1024 * 1024 // 4MB per chunk
+            var offset = 0L
+
+            while (offset < totalSize) {
+                val remaining = totalSize - offset
+                val maxBytes = minOf(chunkSize, remaining)
+
+                val chunk = session.getPartialObject(
+                    PtpDataType.ObjectHandle(handle),
+                    offset, maxBytes
+                ) { loaded, _ ->
+                    onProgress(offset + loaded, totalSize)
+                }
+
+                outputStream.write(chunk)
+                offset += chunk.size
+                onProgress(offset, totalSize)
+
+                // Safety check: if chunk is empty, break to avoid infinite loop
+                if (chunk.isEmpty()) break
+            }
+
+            outputStream.flush()
+            Log.i(TAG, "Streamed $offset bytes to output stream")
+            Result.success(Unit)
+        } catch (e: Exception) {
+            Log.e(TAG, "Stream download failed at offset: ${e.message}")
             Result.failure(e)
         }
     }

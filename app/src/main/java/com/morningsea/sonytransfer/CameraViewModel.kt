@@ -281,30 +281,60 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
                     it.copy(downloadCurrent = i + 1, downloadProgress = 0f)
                 }
 
-                // Get total size for progress
                 val totalSize = cameraClient.getObjectSize(item.handle)
-                val result = cameraClient.downloadPhoto(item.handle) { read, total ->
-                    val t = if (total > 0) total else totalSize
-                    if (t > 0) {
-                        _uiState.update { it.copy(downloadProgress = read.toFloat() / t) }
-                    }
+                val filename = item.filename.ifEmpty { "IMG_${item.handle}" }
+                val (safeName, mediaType) = when (item.photoType) {
+                    PhotoType.JPEG -> if ('.' in filename) filename to MediaSaver.MediaType.IMAGE
+                                     else "$filename.JPG" to MediaSaver.MediaType.IMAGE
+                    PhotoType.RAW -> if (filename.contains(".arw", true)) filename to MediaSaver.MediaType.IMAGE
+                                     else "$filename.ARW" to MediaSaver.MediaType.IMAGE
+                    PhotoType.VIDEO -> if ('.' in filename) filename to MediaSaver.MediaType.VIDEO
+                                       else "$filename.MP4" to MediaSaver.MediaType.VIDEO
+                    PhotoType.OTHER -> filename to MediaSaver.MediaType.IMAGE
                 }
 
-                if (result.isSuccess) {
-                    val data = result.getOrThrow()
-                    // Determine filename with correct extension
-                    val filename = item.filename.ifEmpty { "IMG_${item.handle}" }
-                    val (safeName, mediaType) = when (item.photoType) {
-                        PhotoType.JPEG -> if ('.' in filename) filename to MediaSaver.MediaType.IMAGE
-                                         else "$filename.JPG" to MediaSaver.MediaType.IMAGE
-                        PhotoType.RAW -> if (filename.contains(".arw", true)) filename to MediaSaver.MediaType.IMAGE
-                                         else "$filename.ARW" to MediaSaver.MediaType.IMAGE
-                        PhotoType.VIDEO -> if ('.' in filename) filename to MediaSaver.MediaType.VIDEO
-                                           else "$filename.MP4" to MediaSaver.MediaType.VIDEO
-                        PhotoType.OTHER -> filename to MediaSaver.MediaType.IMAGE
-                    }
+                // Use streaming for large files (> 20MB) to avoid OOM
+                val useStreaming = totalSize > 20L * 1024 * 1024
+                Log.i("CameraVM", "Downloading ${item.filename} size=$totalSize streaming=$useStreaming")
 
-                    MediaSaver.saveFile(getApplication(), data, safeName, mediaType)
+                val success = if (useStreaming) {
+                    // Stream download — chunks written directly to MediaStore
+                    val streamResult = MediaSaver.openOutputStream(getApplication(), safeName, mediaType)
+                    if (streamResult.isFailure) {
+                        Log.w("CameraVM", "Failed to open stream: ${streamResult.exceptionOrNull()?.message}")
+                        false
+                    } else {
+                        val handle = streamResult.getOrThrow()
+                        val dlResult = cameraClient.downloadPhotoToStream(
+                            item.handle, totalSize, handle.stream
+                        ) { read, total ->
+                            if (total > 0) {
+                                _uiState.update { it.copy(downloadProgress = read.toFloat() / total) }
+                            }
+                        }
+                        try { handle.stream.close() } catch (_: Exception) {}
+                        if (dlResult.isSuccess) {
+                            MediaSaver.finalizePendingUri(getApplication(), handle.uri)
+                            true
+                        } else {
+                            Log.w("CameraVM", "Stream download failed: ${dlResult.exceptionOrNull()?.message}")
+                            false
+                        }
+                    }
+                } else {
+                    // In-memory download for small files
+                    val result = cameraClient.downloadPhoto(item.handle) { read, total ->
+                        val t = if (total > 0) total else totalSize
+                        if (t > 0) {
+                            _uiState.update { it.copy(downloadProgress = read.toFloat() / t) }
+                        }
+                    }
+                    if (result.isSuccess) {
+                        MediaSaver.saveFile(getApplication(), result.getOrThrow(), safeName, mediaType).isSuccess
+                    } else false
+                }
+
+                if (success) {
                     ok++
                     _uiState.update { it.copy(downloadedCount = ok) }
                 }

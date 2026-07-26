@@ -470,8 +470,19 @@ fun PhotoGridItem(
 
     // Lazy-load thumbnail as Bitmap
     val thumbnail: Bitmap? by produceState<Bitmap?>(null, item.handle) {
-        val bytes = loadThumbnail(item.handle)
-        value = bytes?.let { BitmapFactory.decodeByteArray(it, 0, it.size) }
+        try {
+            val bytes = loadThumbnail(item.handle)
+            value = bytes?.let {
+                val bmp = BitmapFactory.decodeByteArray(it, 0, it.size)
+                // Downscale large thumbnails to save memory
+                if (bmp != null && (bmp.width > 400 || bmp.height > 400)) {
+                    val scale = 400f / maxOf(bmp.width, bmp.height)
+                    Bitmap.createScaledBitmap(bmp, (bmp.width * scale).toInt(), (bmp.height * scale).toInt(), true)
+                } else bmp
+            }
+        } catch (_: Exception) {
+            value = null
+        }
     }
 
     // Format badge color and text
@@ -496,9 +507,10 @@ fun PhotoGridItem(
             )
     ) {
         // Thumbnail image (or placeholder)
-        if (thumbnail != null) {
+        val thumb = thumbnail
+        if (thumb != null) {
             Image(
-                bitmap = thumbnail!!.asImageBitmap(),
+                bitmap = thumb.asImageBitmap(),
                 contentDescription = item.filename,
                 contentScale = ContentScale.Crop,
                 modifier = Modifier.fillMaxSize()
