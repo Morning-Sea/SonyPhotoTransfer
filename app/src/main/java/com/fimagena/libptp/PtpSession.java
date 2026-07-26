@@ -125,7 +125,7 @@ public class PtpSession {
         request.mParameters = new long[]{objectHandle.mValue};
         PtpOperation.Response response = mSession.executeTransaction(request, listener == null ? null : new PtpTransport.Session.DataLoadListener() {
             @Override public void onDataLoaded(PtpOperation.Request request, long loaded, long expected) {listener.onDataLoaded(loaded, expected);}
-        });
+        }, null);
         response.validate();
         if (!response.isSuccess())
             throw new PtpExceptions.OperationFailed("GetObject", response.getResponseCode());
@@ -133,22 +133,23 @@ public class PtpSession {
     }
 
     /**
-     * GetPartialObject — downloads a chunk of an object (offset + maxBytes).
-     * Added for streaming large video downloads to avoid OOM.
-     * Returns the byte chunk for the specified range.
+     * GetObject streaming variant — writes data directly to outputStream
+     * without accumulating it in memory. Supports files of any size (e.g. 2GB video).
      */
-    public byte[] getPartialObject(PtpDataType.ObjectHandle objectHandle, long offset, long maxBytes, final DataLoadListener listener) throws PtpTransport.TransportError, PtpExceptions.PtpProtocolViolation, PtpExceptions.OperationFailed {
-        PtpOperation.Request request = PtpOperation.createRequest(PtpOperation.OPSCODE_GetPartialObject);
-        if (request == null)
-            throw new PtpExceptions.OperationFailed("GetPartialObject not supported", 0x2005);
-        request.mParameters = new long[]{objectHandle.mValue, offset, maxBytes};
-        PtpOperation.Response response = mSession.executeTransaction(request, listener == null ? null : new PtpTransport.Session.DataLoadListener() {
-            @Override public void onDataLoaded(PtpOperation.Request request, long loaded, long expected) {listener.onDataLoaded(loaded, expected);}
-        });
+    public void getObjectToStream(PtpDataType.ObjectHandle objectHandle, java.io.OutputStream outputStream, final DataLoadListener listener) throws PtpTransport.TransportError, PtpExceptions.PtpProtocolViolation, PtpExceptions.OperationFailed {
+        PtpOperation.Request request = PtpOperation.createRequest(PtpOperation.OPSCODE_GetObject);
+        request.mParameters = new long[]{objectHandle.mValue};
+        PtpOperation.Response response = mSession.executeTransaction(
+            request,
+            listener == null ? null : new PtpTransport.Session.DataLoadListener() {
+                @Override public void onDataLoaded(PtpOperation.Request request, long loaded, long expected) {listener.onDataLoaded(loaded, expected);}
+            },
+            outputStream
+        );
         response.validate();
         if (!response.isSuccess())
-            throw new PtpExceptions.OperationFailed("GetPartialObject", response.getResponseCode());
-        return ((PtpDataType.Object) response.getData()).mObject;
+            throw new PtpExceptions.OperationFailed("GetObject", response.getResponseCode());
+        // Data is already in outputStream; PtpDataType.Object response is empty.
     }
 
     // FIXME: need to check for IMAGE, since (Sony) camera might stop otherwise...

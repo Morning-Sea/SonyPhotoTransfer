@@ -25,6 +25,7 @@ import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
+import java.io.OutputStream;
 
 
 public class DataBuffer implements PtpTransport.PayloadBuffer {
@@ -37,6 +38,13 @@ public class DataBuffer implements PtpTransport.PayloadBuffer {
     private Status mStatus;
 
     private boolean mIsLE = true;
+
+    // Streaming support: when set, incoming data is written directly to this
+    // stream instead of being accumulated in memory. Used for large files
+    // like 2GB videos to avoid OOM.
+    private OutputStream mOutputStream;
+    private long mStreamedBytes = 0;
+    private boolean mStreaming = false;
 
     public DataBuffer()                                          {this(null, 0, true);}
     public DataBuffer(boolean isLittleEndian)                    {this(null, 0, isLittleEndian);}
@@ -57,6 +65,19 @@ public class DataBuffer implements PtpTransport.PayloadBuffer {
         }
         mIsLE = isLittleEndian;
     }
+
+    /**
+     * Enable streaming mode: all data written via writeObject() is sent
+     * directly to outputStream. readObject() returns an empty array.
+     */
+    public void enableStreaming(OutputStream outputStream) {
+        mOutputStream = outputStream;
+        mStreaming = true;
+        mStreamedBytes = 0;
+    }
+
+    public boolean isStreaming() {return mStreaming;}
+    public long getStreamedBytes() {return mStreamedBytes;}
 
     private void startWrite() {
         if (mStatus != Status.WRITE) {
@@ -103,7 +124,7 @@ public class DataBuffer implements PtpTransport.PayloadBuffer {
         else mOut.reset();
     }
 
-    public long size() {return mStatus == Status.WRITE ? mOut.size() : mInData.length;}
+    public long size() {return mStreaming ? mStreamedBytes : (mStatus == Status.WRITE ? mOut.size() : mInData.length);}
 
     @Override public DataBuffer writeUInt8(short uint8) {
         startWrite();
@@ -142,9 +163,18 @@ public class DataBuffer implements PtpTransport.PayloadBuffer {
     }
 
     @Override public DataBuffer writeObject(byte[] byteArray) {
-        startWrite();
         if (byteArray == null) return this;
-        mOut.write(byteArray, 0, byteArray.length);
+        if (mStreaming && mOutputStream != null) {
+            try {
+                mOutputStream.write(byteArray, 0, byteArray.length);
+                mStreamedBytes += byteArray.length;
+            } catch (IOException e) {
+                throw new RuntimeException("Failed to write to stream", e);
+            }
+        } else {
+            startWrite();
+            mOut.write(byteArray, 0, byteArray.length);
+        }
         return this;
     }
 
@@ -192,6 +222,9 @@ public class DataBuffer implements PtpTransport.PayloadBuffer {
 
     @Override public byte[] readObject() {
         try {startRead(0);} catch (PtpIpExceptions.MalformedPacket e) {} //can't happen
+        if (mStreaming) {
+            return new byte[0]; // data was already streamed to file
+        }
         byte[] byteArray = new byte[mIn.available()];
         mIn.read(byteArray, 0, byteArray.length);
         return byteArray;

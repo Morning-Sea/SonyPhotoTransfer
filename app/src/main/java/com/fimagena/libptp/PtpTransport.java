@@ -51,6 +51,12 @@ public abstract class PtpTransport {
 
         PtpOperation.Response executeTransaction(PtpOperation.Request request) throws TransportDataError, TransportIOError, TransportOperationFailed;
         PtpOperation.Response executeTransaction(PtpOperation.Request request, DataLoadListener listener) throws TransportDataError, TransportIOError, TransportOperationFailed;
+        /**
+         * Streaming transaction: if a data-in response arrives, the payload is written
+         * directly to outputStream instead of being accumulated in memory.
+         * Pass null to fall back to in-memory buffering.
+         */
+        PtpOperation.Response executeTransaction(PtpOperation.Request request, DataLoadListener listener, java.io.OutputStream outputStream) throws TransportDataError, TransportIOError, TransportOperationFailed;
         void close() throws TransportDataError, TransportIOError, TransportOperationFailed, PtpExceptions.PtpProtocolViolation;
     }
 

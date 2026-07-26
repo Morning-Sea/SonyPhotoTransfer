@@ -25,6 +25,7 @@ import com.fimagena.libptp.PtpOperation;
 import com.fimagena.libptp.PtpTransport;
 
 import java.io.IOException;
+import java.io.OutputStream;
 import java.util.concurrent.BlockingDeque;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.LinkedBlockingDeque;
@@ -63,16 +64,19 @@ public class PtpIpSession implements PtpTransport.Session {
 
 
     @Override public PtpOperation.Response executeTransaction(PtpOperation.Request request) throws PtpIpExceptions.MalformedPacket, PtpIpExceptions.ProtocolViolation, PtpTransport.TransportIOError, PtpIpExceptions.OperationFailed {
-        return executeTransaction(request, null);
+        return executeTransaction(request, null, null);
     }
     @Override public synchronized PtpOperation.Response executeTransaction(PtpOperation.Request request, DataLoadListener listener) throws PtpIpExceptions.MalformedPacket, PtpIpExceptions.ProtocolViolation, PtpTransport.TransportIOError, PtpIpExceptions.OperationFailed {
+        return executeTransaction(request, listener, null);
+    }
+    @Override public synchronized PtpOperation.Response executeTransaction(PtpOperation.Request request, DataLoadListener listener, OutputStream outputStream) throws PtpIpExceptions.MalformedPacket, PtpIpExceptions.ProtocolViolation, PtpTransport.TransportIOError, PtpIpExceptions.OperationFailed {
         mLastTransactionId++;
-        return executeTransaction(request, mLastTransactionId, listener);
+        return executeTransaction(request, mLastTransactionId, listener, outputStream);
     }
     protected PtpOperation.Response executeNullTransaction(PtpOperation.Request request) throws PtpIpExceptions.MalformedPacket, PtpIpExceptions.ProtocolViolation, PtpTransport.TransportIOError, PtpIpExceptions.OperationFailed {
-        return executeTransaction(request, 0, null);
+        return executeTransaction(request, 0, null, null);
     }
-    private synchronized PtpOperation.Response executeTransaction(PtpOperation.Request request, long transactionId, DataLoadListener listener) throws PtpIpExceptions.MalformedPacket, PtpIpExceptions.ProtocolViolation, PtpTransport.TransportIOError, PtpIpExceptions.OperationFailed {
+    private synchronized PtpOperation.Response executeTransaction(PtpOperation.Request request, long transactionId, DataLoadListener listener, OutputStream outputStream) throws PtpIpExceptions.MalformedPacket, PtpIpExceptions.ProtocolViolation, PtpTransport.TransportIOError, PtpIpExceptions.OperationFailed {
         // synchronized so that there's only one transaction executing at a time per session
 
         if (!mIsOpened && (transactionId != 0))
@@ -146,7 +150,11 @@ public class PtpIpSession implements PtpTransport.Session {
                         throw new PtpIpExceptions.ProtocolViolation("Unknown data length (0xFFFFFFFF) currently not supported!");
                     dataRemaining = ((PtpIpPacket.StartData) packet).mDataLength;
                     dataIn = new DataBuffer((int) dataRemaining);
-                    //TODO...: this can lead to OOM-situations
+                    // If an OutputStream is provided, stream data directly to it
+                    // to avoid loading large files (e.g. 2GB videos) into memory.
+                    if (outputStream != null) {
+                        dataIn.enableStreaming(outputStream);
+                    }
                     status = TransactionStatus.DATA_STARTED;
                 }
 

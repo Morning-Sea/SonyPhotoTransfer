@@ -233,8 +233,9 @@ class SonyCameraClient {
     }
 
     // ── Stream Download to OutputStream (for large files like video) ──
-    // ZV-E10's GetPartialObject only works for offset=0 (non-standard impl),
-    // so we use GetObject (loads full file) with largeHeap for memory headroom.
+    // Uses PtpSession.getObjectToStream() which writes PTP/IP data directly
+    // to the OutputStream without buffering in memory. Supports files of
+    // any size (e.g. 2GB video) without OOM.
 
     suspend fun downloadPhotoToStream(
         handle: Long,
@@ -245,24 +246,21 @@ class SonyCameraClient {
         val session = ptpSession
             ?: return@withContext Result.failure(Exception("No PTP session"))
         try {
-            Log.i(TAG, "GetObject for $handle (${totalSize / 1024 / 1024}MB)")
-            val data = session.getObject(
+            Log.i(TAG, "Streaming GetObject for $handle (${totalSize / 1024 / 1024}MB)")
+            session.getObjectToStream(
                 PtpDataType.ObjectHandle(handle),
+                outputStream,
                 object : PtpSession.DataLoadListener {
                     override fun onDataLoaded(loaded: Long, expected: Long) {
                         onProgress(loaded, if (expected > 0) expected else totalSize)
                     }
                 }
             )
-            outputStream.write(data)
             outputStream.flush()
-            Log.i(TAG, "GetObject done: ${data.size} bytes")
+            Log.i(TAG, "Stream GetObject done")
             Result.success(Unit)
-        } catch (e: OutOfMemoryError) {
-            Log.e(TAG, "OOM downloading ${totalSize / 1024 / 1024}MB file: ${e.message}")
-            Result.failure(Exception("File too large for device memory (${totalSize / 1024 / 1024}MB). Try downloading smaller files."))
         } catch (e: Exception) {
-            Log.e(TAG, "Download failed: ${e.message}")
+            Log.e(TAG, "Stream download failed: ${e.message}")
             Result.failure(e)
         }
     }
