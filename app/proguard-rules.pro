@@ -1,10 +1,5 @@
-# OkHttp
--dontwarn okhttp3.**
--dontwarn okio.**
--keep class okhttp3.** { *; }
+# Keep libptp classes (uses Serializable and reflection)
+-keep class com.fimagena.libptp.** { *; }
 
-# Coil
--keep class coil.** { *; }
-
-# Sony Camera API models
+# Keep ContentItem data class
 -keep class com.morningsea.sonytransfer.ContentItem { *; }

@@ -75,9 +75,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
@@ -87,9 +85,6 @@ import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
-import coil.ImageLoader
-import coil.compose.AsyncImage
-import coil.request.ImageRequest
 
 // ═══════════════════════════════════════════════════════════════════
 //  Color Theme — Sony α inspired dark theme with orange accent
@@ -143,22 +138,14 @@ fun SonyTransferApp(viewModel: CameraViewModel = viewModel()) {
     // ── Permission ───────────────────────────────────────────────
     var hasPermission by remember { mutableStateOf(checkPermission(context)) }
     val launcher = rememberLauncherForActivityResult(
-        ActivityResultContracts.RequestPermission()
-    ) { hasPermission = it }
+        ActivityResultContracts.RequestMultiplePermissions()
+    ) { results -> hasPermission = results.values.all { it } }
 
     LaunchedEffect(Unit) {
         if (!hasPermission) {
-            requiredPermission()?.let { launcher.launch(it) }
+            requiredPermissions()?.let { launcher.launch(it) }
                 ?: run { hasPermission = true }
         }
-    }
-
-    // ── Coil ImageLoader bound to camera WiFi ────────────────────
-    val imageLoader = remember(viewModel.cameraClient.getHttpClient()) {
-        ImageLoader.Builder(context)
-            .okHttpClient(viewModel.cameraClient.getHttpClient())
-            .crossfade(true)
-            .build()
     }
 
     Scaffold(
@@ -225,7 +212,6 @@ fun SonyTransferApp(viewModel: CameraViewModel = viewModel()) {
                 ConnectionState.READY -> GalleryGrid(
                     contents = state.contents,
                     selectedIndices = state.selectedIndices,
-                    imageLoader = imageLoader,
                     onToggleSelect = { viewModel.toggleSelection(it) }
                 )
 
@@ -419,13 +405,11 @@ fun ErrorScreen(message: String, onRetry: () -> Unit) {
 fun GalleryGrid(
     contents: List<ContentItem>,
     selectedIndices: Set<Int>,
-    imageLoader: ImageLoader,
     onToggleSelect: (Int) -> Unit
 ) {
     val gridState = rememberLazyGridState()
 
     if (contents.isEmpty()) {
-        // Empty state
         Column(
             modifier = Modifier.fillMaxSize(),
             horizontalAlignment = Alignment.CenterHorizontally,
@@ -450,12 +434,11 @@ fun GalleryGrid(
     ) {
         itemsIndexed(
             items = contents,
-            key = { index, item -> "${index}_${item.id}" }
+            key = { index, item -> "${index}_${item.handle}" }
         ) { index, item ->
             PhotoGridItem(
                 item = item,
                 isSelected = index in selectedIndices,
-                imageLoader = imageLoader,
                 onClick = { onToggleSelect(index) }
             )
         }
@@ -463,14 +446,13 @@ fun GalleryGrid(
 }
 
 // ═══════════════════════════════════════════════════════════════════
-//  Component: Photo Grid Item
+//  Component: Photo Grid Item (no thumbnail, shows filename + size)
 // ═══════════════════════════════════════════════════════════════════
 
 @Composable
 fun PhotoGridItem(
     item: ContentItem,
     isSelected: Boolean,
-    imageLoader: ImageLoader,
     onClick: () -> Unit
 ) {
     val shape = RoundedCornerShape(6.dp)
@@ -479,6 +461,7 @@ fun PhotoGridItem(
             .padding(2.dp)
             .aspectRatio(1f)
             .clip(shape)
+            .background(MaterialTheme.colorScheme.surfaceVariant)
             .clickable(onClick = onClick)
             .then(
                 if (isSelected) Modifier.border(
@@ -489,17 +472,34 @@ fun PhotoGridItem(
                 else Modifier
             )
     ) {
-        // Thumbnail
-        AsyncImage(
-            model = ImageRequest.Builder(LocalContext.current)
-                .data(item.thumbnailUrl)
-                .crossfade(true)
-                .build(),
-            contentDescription = item.title,
-            imageLoader = imageLoader,
-            contentScale = ContentScale.Crop,
-            modifier = Modifier.fillMaxSize()
-        )
+        Column(
+            modifier = Modifier.fillMaxSize().padding(4.dp),
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.Center
+        ) {
+            Icon(
+                Icons.Default.PhotoLibrary, null,
+                tint = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.5f),
+                modifier = Modifier.size(28.dp)
+            )
+            Spacer(Modifier.height(4.dp))
+            Text(
+                item.filename,
+                fontSize = 9.sp,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                maxLines = 2,
+                overflow = TextOverflow.Ellipsis,
+                textAlign = TextAlign.Center,
+                fontWeight = FontWeight.Medium
+            )
+            if (item.fileSize > 0) {
+                Text(
+                    formatFileSize(item.fileSize),
+                    fontSize = 8.sp,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f)
+                )
+            }
+        }
 
         // Selection indicator (top-right)
         Box(modifier = Modifier.align(Alignment.TopEnd).padding(4.dp)) {
@@ -520,26 +520,30 @@ fun PhotoGridItem(
             }
         }
 
-        // Bottom gradient with filename
-        Box(
-            modifier = Modifier
-                .align(Alignment.BottomCenter)
-                .fillMaxWidth()
-                .background(
-                    Brush.verticalGradient(
-                        colors = listOf(Color.Transparent, Color.Black.copy(alpha = 0.65f))
-                    )
-                )
-                .padding(horizontal = 6.dp, vertical = 4.dp)
-        ) {
+        // Dimensions badge (bottom-left)
+        if (item.imageWidth > 0) {
             Text(
-                item.title,
-                fontSize = 10.sp,
+                "${item.imageWidth}×${item.imageHeight}",
+                fontSize = 7.sp,
                 color = Color.White,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis
+                modifier = Modifier
+                    .align(Alignment.BottomStart)
+                    .padding(2.dp)
+                    .background(Color.Black.copy(alpha = 0.5f), RoundedCornerShape(2.dp))
+                    .padding(horizontal = 3.dp, vertical = 1.dp)
             )
         }
+    }
+}
+
+/** Format file size to human-readable string */
+fun formatFileSize(bytes: Long): String {
+    val kb = bytes / 1024.0
+    val mb = kb / 1024.0
+    return when {
+        mb >= 1 -> String.format("%.1fMB", mb)
+        kb >= 1 -> String.format("%.0fKB", kb)
+        else -> "${bytes}B"
     }
 }
 
@@ -686,17 +690,33 @@ private fun checkPermission(context: android.content.Context): Boolean = when {
     Build.VERSION.SDK_INT >= 33 ->
         ContextCompat.checkSelfPermission(
             context, Manifest.permission.READ_MEDIA_IMAGES
+        ) == PackageManager.PERMISSION_GRANTED &&
+        ContextCompat.checkSelfPermission(
+            context, Manifest.permission.ACCESS_FINE_LOCATION
         ) == PackageManager.PERMISSION_GRANTED
-
-    Build.VERSION.SDK_INT >= 29 -> true  // scoped storage, no permission needed
+    Build.VERSION.SDK_INT >= 29 ->
+        ContextCompat.checkSelfPermission(
+            context, Manifest.permission.ACCESS_FINE_LOCATION
+        ) == PackageManager.PERMISSION_GRANTED
     else ->
         ContextCompat.checkSelfPermission(
             context, Manifest.permission.WRITE_EXTERNAL_STORAGE
+        ) == PackageManager.PERMISSION_GRANTED &&
+        ContextCompat.checkSelfPermission(
+            context, Manifest.permission.ACCESS_FINE_LOCATION
         ) == PackageManager.PERMISSION_GRANTED
 }
 
-private fun requiredPermission(): String? = when {
-    Build.VERSION.SDK_INT >= 33 -> Manifest.permission.READ_MEDIA_IMAGES
-    Build.VERSION.SDK_INT >= 29 -> null
-    else -> Manifest.permission.WRITE_EXTERNAL_STORAGE
+private fun requiredPermissions(): Array<String>? = when {
+    Build.VERSION.SDK_INT >= 33 -> arrayOf(
+        Manifest.permission.READ_MEDIA_IMAGES,
+        Manifest.permission.ACCESS_FINE_LOCATION
+    )
+    Build.VERSION.SDK_INT >= 29 -> arrayOf(
+        Manifest.permission.ACCESS_FINE_LOCATION
+    )
+    else -> arrayOf(
+        Manifest.permission.WRITE_EXTERNAL_STORAGE,
+        Manifest.permission.ACCESS_FINE_LOCATION
+    )
 }

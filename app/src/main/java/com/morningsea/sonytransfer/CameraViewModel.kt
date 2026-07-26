@@ -35,8 +35,6 @@ data class UiState(
     val contents: List<ContentItem> = emptyList(),
     val selectedIndices: Set<Int> = emptySet(),
     val totalCount: Int = 0,
-    val hasMore: Boolean = false,
-    val isLoadingMore: Boolean = false,
     val isDownloading: Boolean = false,
     val downloadProgress: Float = 0f,
     val downloadCurrent: Int = 0,
@@ -52,7 +50,6 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
     val cameraClient = SonyCameraClient()
     private var downloadJob: Job? = null
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
-    private var transferStarted = false
 
     private fun getConnectivityManager(): ConnectivityManager {
         return getApplication<Application>()
@@ -153,114 +150,77 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
             // === Get Camera IP from DHCP gateway ===
             val ctx = getApplication<Application>()
             val gatewayIp = cameraClient.getGatewayIp(ctx)
-            if (gatewayIp != null) {
-                cameraClient.setBaseUrl(gatewayIp, 64321)
-                _uiState.update {
-                    it.copy(
-                        cameraIp = gatewayIp,
-                        statusMessage = "Camera at $gatewayIp:64321, checking…"
-                    )
-                }
-            } else {
-                // Fallback to default Sony IP
-                cameraClient.setBaseUrl("192.168.122.1", 64321)
-                _uiState.update {
-                    it.copy(
-                        cameraIp = "192.168.122.1 (default)",
-                        statusMessage = "Using default IP, checking…"
-                    )
-                }
+            val cameraIp = gatewayIp ?: "192.168.122.1"
+
+            _uiState.update {
+                it.copy(
+                    cameraIp = cameraIp,
+                    connectionState = ConnectionState.CONNECTING,
+                    statusMessage = "Connecting to $cameraIp:15740 (PTP/IP)…"
+                )
             }
 
-            // === Check camera reachability ===
-            val reachable = cameraClient.checkReachable()
-            if (reachable.isFailure) {
-                val errorDetail = reachable.exceptionOrNull()?.let {
-                    "${it.javaClass.simpleName}: ${it.message ?: "no message"}"
+            // === Connect via PTP/IP ===
+            val connectResult = cameraClient.connectToCamera(cameraIp)
+            if (connectResult.isFailure) {
+                val errorDetail = connectResult.exceptionOrNull()?.let { e ->
+                    "${e.javaClass.simpleName}: ${e.message}"
                 } ?: "Unknown error"
                 _uiState.update {
                     it.copy(
                         connectionState = ConnectionState.ERROR,
                         errorMessage = buildString {
-                            append("Camera not reachable at ${cameraClient.getBaseUrl()}\n\n")
+                            append("Failed to connect to camera at $cameraIp:15740\n\n")
                             append("Error: $errorDetail\n\n")
                             if (!wifiBound) {
-                                append("⚠ WiFi binding failed (Tier 1-3 all failed).\n")
-                                append("→ This is the most likely cause.\n")
-                                append("→ Try: Turn OFF mobile data, then retry.\n")
-                                append("→ Or: In phone WiFi settings, find camera WiFi,\n")
-                                append("   tap it → 'Yes' to stay connected.\n\n")
+                                append("⚠ WiFi binding failed.\n")
+                                append("→ Turn OFF mobile data, then retry.\n\n")
                             }
                             append("Steps:\n")
-                            append("1. Camera: MENU → Network → Send to Smartphone\n")
-                            append("2. Select any photo to start WiFi AP\n")
-                            append("3. Phone: Connect to camera's WiFi\n")
+                            append("1. Camera: Playback → MENU → Network → Send to Smartphone\n")
+                            append("2. Select a photo → camera shows QR code\n")
+                            append("3. Phone: Connect to camera WiFi\n")
                             append("4. Turn off mobile data\n")
                             append("5. Tap Retry")
                         },
-                        statusMessage = "Camera not reachable"
+                        statusMessage = "Connection failed"
                     )
                 }
                 return@launch
             }
 
-            // === SOAP: Start Transfer Session ===
+            val modelName = connectResult.getOrDefault("Sony Camera")
+
+            // === List Photos ===
             _uiState.update {
                 it.copy(
-                    connectionState = ConnectionState.CONNECTING,
-                    statusMessage = "Starting transfer session…"
+                    statusMessage = "Connected to $modelName, listing photos…"
                 )
             }
-            val startResult = cameraClient.startTransfer()
-            if (startResult.isFailure) {
+
+            val listResult = cameraClient.getPhotoList()
+            if (listResult.isFailure) {
                 _uiState.update {
                     it.copy(
                         connectionState = ConnectionState.ERROR,
-                        errorMessage = "Failed to start transfer:\n${startResult.exceptionOrNull()?.message}",
-                        statusMessage = "Transfer start failed"
+                        errorMessage = "Failed to list photos:\n${listResult.exceptionOrNull()?.message}",
+                        statusMessage = "List failed"
                     )
                 }
-                return@launch
-            }
-            transferStarted = true
-
-            // === Browse Photos ===
-            _uiState.update { it.copy(statusMessage = "Browsing photos…") }
-
-            // Try PhotoRoot first (browse all from phone), fallback to PushRoot
-            var browseResult = cameraClient.browseAll(ROOT_DIR_PULL)
-            if (browseResult.isFailure || browseResult.getOrDefault(emptyList()).isEmpty()) {
-                Log.i(TAG, "PhotoRoot empty/failed, trying PushRoot")
-                _uiState.update { it.copy(statusMessage = "Trying PushRoot…") }
-                browseResult = cameraClient.browseAll(ROOT_DIR_PUSH)
-            }
-
-            if (browseResult.isFailure) {
-                _uiState.update {
-                    it.copy(
-                        connectionState = ConnectionState.ERROR,
-                        errorMessage = "Failed to browse photos:\n${browseResult.exceptionOrNull()?.message}",
-                        statusMessage = "Browse failed"
-                    )
-                }
-                // End transfer session on error
-                cameraClient.endTransfer()
-                transferStarted = false
+                cameraClient.disconnect()
                 return@launch
             }
 
-            val contents = browseResult.getOrDefault(emptyList())
+            val contents = listResult.getOrDefault(emptyList())
             if (contents.isEmpty()) {
                 _uiState.update {
                     it.copy(
                         connectionState = ConnectionState.ERROR,
-                        errorMessage = "No photos found on camera.\n\n" +
-                                "Make sure there are photos on the SD card, and the camera is in 'Send to Smartphone' mode.",
+                        errorMessage = "No photos found on camera.\n\nMake sure there are JPEG photos on the SD card.",
                         statusMessage = "No photos"
                     )
                 }
-                cameraClient.endTransfer()
-                transferStarted = false
+                cameraClient.disconnect()
                 return@launch
             }
 
@@ -269,8 +229,7 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
                     connectionState = ConnectionState.READY,
                     contents = contents,
                     totalCount = contents.size,
-                    hasMore = false,
-                    statusMessage = "${contents.size} photos on camera"
+                    statusMessage = "${contents.size} photos on $modelName"
                 )
             }
         }
@@ -300,7 +259,7 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
         val state = _uiState.value
         val items = state.selectedIndices.sorted().mapNotNull { idx ->
             state.contents.getOrNull(idx)
-        }.filter { it.originalUrl != null }
+        }
         if (items.isEmpty()) return
 
         downloadJob = viewModelScope.launch {
@@ -322,19 +281,21 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
                     it.copy(downloadCurrent = i + 1, downloadProgress = 0f)
                 }
 
-                val url = item.originalUrl ?: continue
-                val result = cameraClient.downloadPhoto(url) { read, total ->
-                    if (total > 0) {
-                        _uiState.update { it.copy(downloadProgress = read.toFloat() / total) }
+                // Get total size for progress
+                val totalSize = cameraClient.getObjectSize(item.handle)
+                val result = cameraClient.downloadPhoto(item.handle) { read, total ->
+                    val t = if (total > 0) total else totalSize
+                    if (t > 0) {
+                        _uiState.update { it.copy(downloadProgress = read.toFloat() / t) }
                     }
                 }
 
                 if (result.isSuccess) {
                     val data = result.getOrThrow()
-                    val filename = if ('.' in item.title) item.title
-                    else "${item.title}.JPG"
+                    val filename = item.filename.ifEmpty { "IMG_${item.handle}.JPG" }
+                    val safeName = if ('.' in filename) filename else "$filename.JPG"
 
-                    MediaSaver.saveImage(getApplication(), data, filename)
+                    MediaSaver.saveImage(getApplication(), data, safeName)
                     ok++
                     _uiState.update { it.copy(downloadedCount = ok) }
                 }
@@ -360,15 +321,26 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
         }
     }
 
+    // ── Thumbnail Loading (for UI) ──────────────────────────────────
+
+    private val _thumbnailCache = mutableMapOf<Long, ByteArray>()
+
+    suspend fun loadThumbnail(handle: Long): ByteArray? {
+        _thumbnailCache[handle]?.let { return it }
+        val result = cameraClient.getThumbnail(handle)
+        if (result.isSuccess) {
+            val thumb = result.getOrThrow()
+            _thumbnailCache[handle] = thumb
+            return thumb
+        }
+        return null
+    }
+
     // ── Disconnect ───────────────────────────────────────────────────
 
     fun disconnect() {
-        // End SOAP transfer session (fire-and-forget on background thread)
-        if (transferStarted) {
-            CoroutineScope(Dispatchers.IO).launch { cameraClient.endTransfer() }
-            transferStarted = false
-        }
-        // Unbind WiFi
+        cameraClient.disconnect()
+        _thumbnailCache.clear()
         val cm = getConnectivityManager()
         cm.bindProcessToNetwork(null)
         networkCallback?.let {

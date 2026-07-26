@@ -4,91 +4,71 @@ import android.content.Context
 import android.net.Network
 import android.net.wifi.WifiManager
 import android.util.Log
+import com.fimagena.libptp.PtpConnection
+import com.fimagena.libptp.PtpDataType
+import com.fimagena.libptp.PtpSession
+import com.fimagena.libptp.PtpTransport
+import com.fimagena.libptp.ptpip.PtpIpConnection
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
-import okhttp3.MediaType.Companion.toMediaType
-import okhttp3.OkHttpClient
-import okhttp3.Request
-import okhttp3.RequestBody.Companion.toRequestBody
-import org.w3c.dom.Element
-import java.io.ByteArrayInputStream
-import java.io.ByteArrayOutputStream
-import java.util.concurrent.TimeUnit
-import javax.xml.parsers.DocumentBuilderFactory
+import java.net.InetAddress
 
 private const val TAG = "SonyCam"
 
-const val ROOT_DIR_PUSH = "PushRoot"   // images user selected on camera
-const val ROOT_DIR_PULL = "PhotoRoot"  // all images, browse from phone
+/** JPEG object format code in PTP standard */
+private const val FORMAT_JPEG = 0xB101
 
-data class ContentItem(
-    val id: String,
-    val title: String,
-    val thumbnailUrl: String?,
-    val largeUrl: String?,
-    val originalUrl: String?,
-    val fileSize: Long
+/** PTP/IP standard port (confirmed open on ZV-E10) */
+private const val PTP_PORT = 15740
+
+/**
+ * Any 16-byte GUID works for Sony cameras (pairing unnecessary).
+ * Using the same pattern as libptp's PtpTester.
+ */
+private val PTP_GUID = shortArrayOf(
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0xff.toShort(), 0xff.toShort(), 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
 )
 
-data class BrowseResult(
-    val items: List<ContentItem>,
-    val containerIds: List<String>,
-    val numberReturned: Int,
-    val totalMatches: Int
+private const val FRIENDLY_NAME = "SonyTransfer"
+
+data class ContentItem(
+    val handle: Long,           // PTP object handle
+    val filename: String,       // e.g. "DSC00123.JPG"
+    val fileSize: Long,         // compressed size in bytes
+    val imageWidth: Int,        // pixels
+    val imageHeight: Int,       // pixels
+    val thumbFormat: Int        // format code for thumbnail
 )
 
 /**
- * Client for Sony camera's DLNA/UPnP SOAP protocol (port 64321).
+ * Sony Camera Client using PTP/IP protocol (port 15740).
  *
- * This is the protocol used in "Send to Smartphone" camera mode.
- * The camera exposes itself as a UPnP MediaServer (DMS-1.50).
+ * The ZV-E10 (firmware 2.02) uses PTP/IP (ISO 15740) for photo transfer,
+ * NOT the SOAP/UPnP protocol on port 64321 (which returns 404 on newer firmware).
  *
- * Flow:
- * 1. GET /DmsDescPush.xml → device description
- * 2. SOAP X_TransferStart → begin transfer session
- * 3. SOAP Browse on ContentDirectory → list photos (DIDL-Lite)
- * 4. HTTP GET on res URLs → download photos
- * 5. SOAP X_TransferEnd → end session
+ * Protocol flow (via libptp library):
+ * 1. PtpIpConnection → connect to camera at ip:15740
+ * 2. openSession()
+ * 3. getStorageIDs() → get SD card storage IDs
+ * 4. getObjectHandles(storageId, FORMAT_JPEG) → get all JPEG photo handles
+ * 5. getObjectInfo(handle) → get filename, size, dimensions
+ * 6. getThumb(handle) → download thumbnail bytes
+ * 7. getObject(handle) → download full photo bytes
  */
 class SonyCameraClient {
 
-    private var client: OkHttpClient = buildClient()
-    private var baseUrl: String = "http://192.168.122.1:64321"
+    private var ptpConnection: PtpConnection? = null
+    private var ptpSession: PtpSession? = null
 
-    private val contentDirectoryUrl get() = "$baseUrl/upnp/control/ContentDirectory"
-    private val xPushListUrl get() = "$baseUrl/upnp/control/XPushList"
-
-    private val nsSoap = "http://schemas.xmlsoap.org/soap/envelope/"
-    private val nsContentDirectory = "urn:schemas-upnp-org:service:ContentDirectory:1"
-    private val nsXPushList = "urn:schemas-sony-com:service:XPushList:1"
+    // ── WiFi Network Binding ────────────────────────────────────────
+    // bindProcessToNetwork() is called by the ViewModel.
+    // PTP/IP uses raw java.net.Socket which respects process binding.
 
     fun bindToNetwork(network: Network) {
-        // NOTE: We intentionally do NOT use network.socketFactory here.
-        // On many Chinese ROMs (ColorOS/HyperOS/MIUI), network.socketFactory
-        // throws "SocketException: EPERM (Operation not permitted)" when
-        // binding sockets to a no-internet WiFi network.
-        //
-        // Instead, we rely on ConnectivityManager.bindProcessToNetwork()
-        // (called from the ViewModel) which routes ALL process traffic through
-        // the WiFi network at the system level, including default OkHttp sockets.
-        client = buildClient()
+        // No-op: process-level binding via ConnectivityManager.bindProcessToNetwork()
+        // in the ViewModel covers raw sockets too.
     }
-
-    fun getHttpClient(): OkHttpClient = client
-
-    private fun buildClient(): OkHttpClient {
-        return OkHttpClient.Builder().apply {
-            connectTimeout(10, TimeUnit.SECONDS)
-            readTimeout(120, TimeUnit.SECONDS)
-            writeTimeout(60, TimeUnit.SECONDS)
-        }.build()
-    }
-
-    fun setBaseUrl(ip: String, port: Int = 64321) {
-        baseUrl = "http://$ip:$port"
-    }
-
-    fun getBaseUrl(): String = baseUrl
 
     // ── Get Camera IP from WiFi DHCP ─────────────────────────────────
 
@@ -106,290 +86,154 @@ class SonyCameraClient {
         }
     }
 
-    // ── Reachability Check ───────────────────────────────────────────
+    // ── Connect to Camera via PTP/IP ─────────────────────────────────
 
-    suspend fun checkReachable(): Result<String> = withContext(Dispatchers.IO) {
+    suspend fun connectToCamera(ip: String): Result<String> = withContext(Dispatchers.IO) {
         try {
-            val req = Request.Builder().url("$baseUrl/DmsDescPush.xml").build()
-            val resp = client.newCall(req).execute()
-            val body = resp.body?.string()
-                ?: return@withContext Result.failure(Exception("Empty response body"))
-            if (resp.isSuccessful && body.contains("SonyDigitalMediaServer")) {
-                Result.success("OK")
-            } else {
-                Result.failure(Exception("HTTP ${resp.code}: response doesn't match SonyDigitalMediaServer"))
-            }
+            Log.i(TAG, "Connecting to PTP/IP at $ip:$PTP_PORT")
+
+            val address = PtpIpConnection.PtpIpAddress(
+                InetAddress.getByName(ip), PTP_PORT
+            )
+            val hostId = PtpIpConnection.PtpIpHostId(
+                PTP_GUID, FRIENDLY_NAME
+            )
+            val transport = PtpIpConnection()
+            val connection = PtpConnection(transport)
+
+            connection.connect(address, hostId)
+            ptpConnection = connection
+            Log.i(TAG, "PTP/IP connected, opening session...")
+
+            val session = connection.openSession()
+            ptpSession = session
+            Log.i(TAG, "PTP session opened")
+
+            // Get device info for model name
+            val deviceInfo = connection.deviceInfo
+            val modelName = deviceInfo?.mModel?.mString ?: "Sony Camera"
+            Log.i(TAG, "Camera model: $modelName")
+
+            Result.success(modelName)
         } catch (e: Exception) {
-            Log.w(TAG, "Reachability check failed: ${e.javaClass.simpleName}: ${e.message}")
+            Log.e(TAG, "PTP connect failed: ${e.javaClass.simpleName}: ${e.message}")
             Result.failure(e)
         }
     }
 
-    // ── SOAP: X_TransferStart ─────────────────────────────────────────
+    // ── List All Photos ──────────────────────────────────────────────
 
-    suspend fun startTransfer(): Result<Unit> = withContext(Dispatchers.IO) {
+    suspend fun getPhotoList(): Result<List<ContentItem>> = withContext(Dispatchers.IO) {
+        val session = ptpSession
+            ?: return@withContext Result.failure(Exception("No PTP session"))
+
         try {
-            val body = """<?xml version="1.0" encoding="utf-8"?>
-<s:Envelope xmlns:s="$nsSoap" s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/">
-<s:Body>
-<u:X_TransferStart xmlns:u="$nsXPushList"></u:X_TransferStart>
-</s:Body>
-</s:Envelope>""".trimIndent()
+            val storageIds = session.storageIDs
+            Log.i(TAG, "Found ${storageIds.size} storage(s)")
 
-            val req = Request.Builder()
-                .url(xPushListUrl)
-                .header("SOAPACTION", "\"$nsXPushList#X_TransferStart\"")
-                .header("Content-Type", "text/xml; charset=\"utf-8\"")
-                .post(body.toRequestBody("text/xml; charset=utf-8".toMediaType()))
-                .build()
+            val allItems = mutableListOf<ContentItem>()
 
-            val resp = client.newCall(req).execute()
-            Log.i(TAG, "TransferStart: HTTP ${resp.code}")
-            Result.success(Unit)
-        } catch (e: Exception) {
-            Log.w(TAG, "TransferStart failed: ${e.message}")
-            Result.failure(e)
-        }
-    }
+            for (storageId in storageIds) {
+                val sid = storageId.mValue
+                Log.i(TAG, "Storage $sid: getting handles...")
 
-    // ── SOAP: X_TransferEnd ───────────────────────────────────────────
+                // Get JPEG photo handles (format 0xB101)
+                val handles = session.getObjectHandles(
+                    storageId,
+                    PtpDataType.ObjectFormatCode(FORMAT_JPEG)
+                )
+                Log.i(TAG, "Storage $sid: ${handles.size} JPEG objects")
 
-    suspend fun endTransfer(): Result<Unit> = withContext(Dispatchers.IO) {
-        try {
-            val body = """<?xml version="1.0" encoding="utf-8"?>
-<s:Envelope xmlns:s="$nsSoap" s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/">
-<s:Body>
-<u:X_TransferEnd xmlns:u="$nsXPushList">
-<SourceType>0</SourceType>
-</u:X_TransferEnd>
-</s:Body>
-</s:Envelope>""".trimIndent()
-
-            val req = Request.Builder()
-                .url(xPushListUrl)
-                .header("SOAPACTION", "\"$nsXPushList#X_TransferEnd\"")
-                .header("Content-Type", "text/xml; charset=\"utf-8\"")
-                .post(body.toRequestBody("text/xml; charset=utf-8".toMediaType()))
-                .build()
-
-            val resp = client.newCall(req).execute()
-            Log.i(TAG, "TransferEnd: HTTP ${resp.code}")
-            Result.success(Unit)
-        } catch (e: Exception) {
-            Log.w(TAG, "TransferEnd failed: ${e.message}")
-            Result.failure(e)
-        }
-    }
-
-    // ── SOAP: Browse (ContentDirectory) ───────────────────────────────
-
-    suspend fun browseDirectory(
-        objectId: String,
-        startingIndex: Int = 0,
-        requestedCount: Int = 100
-    ): Result<BrowseResult> = withContext(Dispatchers.IO) {
-        try {
-            val body = """<?xml version="1.0" encoding="utf-8"?>
-<s:Envelope xmlns:s="$nsSoap" s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/">
-<s:Body>
-<u:Browse xmlns:u="$nsContentDirectory">
-<ObjectID>$objectId</ObjectID>
-<BrowseFlag>BrowseDirectChildren</BrowseFlag>
-<Filter>*</Filter>
-<StartingIndex>$startingIndex</StartingIndex>
-<RequestedCount>$requestedCount</RequestedCount>
-<SortCriteria></SortCriteria>
-</u:Browse>
-</s:Body>
-</s:Envelope>""".trimIndent()
-
-            val req = Request.Builder()
-                .url(contentDirectoryUrl)
-                .header("SOAPACTION", "\"$nsContentDirectory#Browse\"")
-                .header("Content-Type", "text/xml; charset=\"utf-8\"")
-                .post(body.toRequestBody("text/xml; charset=utf-8".toMediaType()))
-                .build()
-
-            val resp = client.newCall(req).execute()
-            val xml = resp.body?.string()
-                ?: return@withContext Result.failure(Exception("Empty Browse response"))
-            Log.d(TAG, "Browse raw (first 300): ${xml.take(300)}")
-
-            parseBrowseResponse(xml)
-        } catch (e: Exception) {
-            Log.w(TAG, "Browse failed: ${e.message}")
-            Result.failure(e)
-        }
-    }
-
-    /**
-     * Recursively browse a directory tree, collecting all photo items.
-     */
-    suspend fun browseAll(rootId: String): Result<List<ContentItem>> =
-        withContext(Dispatchers.IO) {
-            try {
-                val allItems = mutableListOf<ContentItem>()
-                val queue = ArrayDeque<String>()
-                queue.add(rootId)
-
-                while (queue.isNotEmpty()) {
-                    val currentId = queue.removeFirst()
-                    var startIndex = 0
-
-                    // Paginate through all results in this directory
-                    while (true) {
-                        val result = browseDirectory(currentId, startIndex)
-                        if (result.isFailure) {
-                            Log.w(TAG, "Browse failed for $currentId at $startIndex: ${result.exceptionOrNull()?.message}")
-                            break
-                        }
-                        val br = result.getOrThrow()
-                        allItems.addAll(br.items)
-                        queue.addAll(br.containerIds)
-                        startIndex += br.numberReturned
-                        if (startIndex >= br.totalMatches || br.numberReturned == 0) break
+                for (handle in handles) {
+                    try {
+                        val info = session.getObjectInfo(handle)
+                        allItems.add(
+                            ContentItem(
+                                handle = handle.mValue,
+                                filename = info.mFilename.mString.ifEmpty {
+                                    "IMG_${handle.mValue}"
+                                },
+                                fileSize = info.mObjectCompressedSize.mValue,
+                                imageWidth = info.mImagePixWidth.mValue.toInt(),
+                                imageHeight = info.mImagePixHeight.mValue.toInt(),
+                                thumbFormat = info.mThumbFormat.mValue
+                            )
+                        )
+                    } catch (e: Exception) {
+                        Log.w(TAG, "Failed to get info for handle ${handle.mValue}: ${e.message}")
                     }
                 }
-
-                Log.i(TAG, "browseAll: collected ${allItems.size} items from $rootId")
-                Result.success(allItems)
-            } catch (e: Exception) {
-                Result.failure(e)
-            }
-        }
-
-    // ── DIDL-Lite Parsing ─────────────────────────────────────────────
-
-    private fun parseBrowseResponse(soapXml: String): Result<BrowseResult> {
-        return try {
-            val factory = DocumentBuilderFactory.newInstance().apply {
-                isNamespaceAware = false
-            }
-            val builder = factory.newDocumentBuilder()
-
-            // Parse outer SOAP envelope
-            val doc = builder.parse(ByteArrayInputStream(soapXml.toByteArray(Charsets.UTF_8)))
-
-            // Extract <Result> which contains escaped DIDL-Lite XML
-            val resultNodes = doc.getElementsByTagName("Result")
-            if (resultNodes.length == 0) {
-                return Result.failure(Exception("No <Result> in Browse response"))
-            }
-            val didlLiteXml = resultNodes.item(0).textContent
-            Log.d(TAG, "DIDL-Lite (first 500): ${didlLiteXml.take(500)}")
-
-            // Parse the DIDL-Lite
-            val didlDoc = builder.parse(ByteArrayInputStream(didlLiteXml.toByteArray(Charsets.UTF_8)))
-
-            val items = mutableListOf<ContentItem>()
-            val containerIds = mutableListOf<String>()
-
-            // Collect containers (subdirectories)
-            val containerNodes = didlDoc.getElementsByTagName("container")
-            for (i in 0 until containerNodes.length) {
-                val elem = containerNodes.item(i) as Element
-                val id = elem.getAttribute("id")
-                if (id.isNotEmpty()) {
-                    containerIds.add(id)
-                    Log.d(TAG, "Found container: $id")
-                }
             }
 
-            // Collect items (photos)
-            val itemNodes = didlDoc.getElementsByTagName("item")
-            for (i in 0 until itemNodes.length) {
-                val itemElem = itemNodes.item(i) as Element
-                val id = itemElem.getAttribute("id")
-
-                // Get title
-                val titleNodes = itemElem.getElementsByTagName("dc:title")
-                val title = if (titleNodes.length > 0)
-                    titleNodes.item(0).textContent else "Untitled"
-
-                // Get all <res> elements and find best URLs
-                val resNodes = itemElem.getElementsByTagName("res")
-                var bestUrl: String? = null
-                var bestSize: Long = 0
-                var thumbUrl: String? = null
-                var largeUrl: String? = null
-
-                for (j in 0 until resNodes.length) {
-                    val resElem = resNodes.item(j) as Element
-                    val url = resElem.textContent?.trim() ?: continue
-                    val size = resElem.getAttribute("size").toLongOrNull() ?: 0
-                    val protocolInfo = resElem.getAttribute("protocolInfo")
-
-                    // Classify by protocolInfo suffix
-                    when {
-                        protocolInfo.contains("_TN") -> thumbUrl = url
-                        protocolInfo.contains("_LRG") -> largeUrl = url
-                    }
-
-                    // Track largest = original
-                    if (size > bestSize) {
-                        bestSize = size
-                        bestUrl = url
-                    }
-                }
-
-                // Fallbacks for best URL
-                if (bestUrl == null) bestUrl = largeUrl ?: thumbUrl
-                if (thumbUrl == null) thumbUrl = largeUrl
-
-                items.add(ContentItem(
-                    id = id,
-                    title = title,
-                    thumbnailUrl = thumbUrl,
-                    largeUrl = largeUrl,
-                    originalUrl = bestUrl,
-                    fileSize = bestSize
-                ))
-            }
-
-            // Pagination info
-            val nrNodes = doc.getElementsByTagName("NumberReturned")
-            val tmNodes = doc.getElementsByTagName("TotalMatches")
-            val numberReturned = if (nrNodes.length > 0)
-                nrNodes.item(0).textContent.toIntOrNull() ?: 0 else 0
-            val totalMatches = if (tmNodes.length > 0)
-                tmNodes.item(0).textContent.toIntOrNull() ?: 0 else 0
-
-            Log.i(TAG, "Parsed: ${items.size} items, $numberReturned returned, $totalMatches total")
-            Result.success(BrowseResult(items, containerIds, numberReturned, totalMatches))
+            Log.i(TAG, "Total: ${allItems.size} photos")
+            Result.success(allItems)
         } catch (e: Exception) {
-            Log.w(TAG, "Parse failed: ${e.message}")
+            Log.e(TAG, "getPhotoList failed: ${e.message}")
             Result.failure(e)
         }
     }
 
-    // ── Download Photo ────────────────────────────────────────────────
+    // ── Download Thumbnail ───────────────────────────────────────────
+
+    suspend fun getThumbnail(handle: Long): Result<ByteArray> = withContext(Dispatchers.IO) {
+        val session = ptpSession
+            ?: return@withContext Result.failure(Exception("No PTP session"))
+        try {
+            val thumb = session.getThumb(PtpDataType.ObjectHandle(handle))
+            Result.success(thumb)
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+
+    // ── Download Full Photo ──────────────────────────────────────────
 
     suspend fun downloadPhoto(
-        url: String,
+        handle: Long,
         onProgress: (bytesRead: Long, totalBytes: Long) -> Unit = { _, _ -> }
     ): Result<ByteArray> = withContext(Dispatchers.IO) {
+        val session = ptpSession
+            ?: return@withContext Result.failure(Exception("No PTP session"))
         try {
-            val req = Request.Builder().url(url).build()
-            val resp = client.newCall(req).execute()
-            if (!resp.isSuccessful) {
-                return@withContext Result.failure(Exception("HTTP ${resp.code}"))
-            }
-            val body = resp.body
-                ?: return@withContext Result.failure(Exception("Empty response body"))
-            val totalBytes = body.contentLength()
-            val input = body.byteStream()
-            val output = ByteArrayOutputStream()
-            val buffer = ByteArray(8192)
-            var bytesRead: Long = 0
-            var n: Int
-            while (input.read(buffer).also { n = it } != -1) {
-                output.write(buffer, 0, n)
-                bytesRead += n
-                onProgress(bytesRead, totalBytes)
-            }
-            Result.success(output.toByteArray())
+            val data = session.getObject(
+                PtpDataType.ObjectHandle(handle),
+                object : PtpSession.DataLoadListener {
+                    override fun onDataLoaded(loaded: Long, expected: Long) {
+                        onProgress(loaded, expected)
+                    }
+                }
+            )
+            Result.success(data)
         } catch (e: Exception) {
             Result.failure(e)
         }
+    }
+
+    // ── Get file size for a handle (for progress) ────────────────────
+
+    suspend fun getObjectSize(handle: Long): Long = withContext(Dispatchers.IO) {
+        val session = ptpSession ?: return@withContext 0L
+        try {
+            val info = session.getObjectInfo(PtpDataType.ObjectHandle(handle))
+            info.mObjectCompressedSize.mValue
+        } catch (_: Exception) { 0L }
+    }
+
+    // ── Disconnect ───────────────────────────────────────────────────
+
+    fun disconnect() {
+        try {
+            ptpSession?.close()
+        } catch (e: Exception) {
+            Log.w(TAG, "Session close error: ${e.message}")
+        }
+        try {
+            ptpConnection?.close()
+        } catch (e: Exception) {
+            Log.w(TAG, "Connection close error: ${e.message}")
+        }
+        ptpSession = null
+        ptpConnection = null
+        Log.i(TAG, "PTP disconnected")
     }
 }
