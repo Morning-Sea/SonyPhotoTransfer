@@ -29,6 +29,17 @@ Any Sony camera that supports the **Camera Remote API** (JSON-RPC over WiFi), in
 
 > **Note:** ZV-E10 II and newer cameras that use Creators' App may not need this tool.
 
+## 📚 Third-Party Libraries
+
+This project incorporates source code from the following library:
+
+- **[libptp](https://github.com/Fimagena/libptp)** — Java implementation of PTP/IP protocol (ISO 15740).  
+  Copyright (C) 2017 Fimagena (fimagena at gmail dot com).  
+  Licensed under the **GNU Lesser General Public License v2.1** (see [`libptp-LGPL-2.1.txt`](libptp-LGPL-2.1.txt)).  
+  libptp source files are located in `app/src/main/java/com/fimagena/libptp/`.
+
+The library has been modified to support streaming file transfers (see AGENTS.md for details). All modifications are released under LGPL 2.1 as required by the license.
+
 ## 🚀 Usage
 
 1. **On camera:** Menu → Network → Send to Smartphone (or "Ctrl w/ Smartphone")
